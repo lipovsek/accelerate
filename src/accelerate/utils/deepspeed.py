@@ -13,13 +13,107 @@
 # limitations under the License.
 
 import base64
-import io
 import json
 import os
 from copy import deepcopy
 
+from torch import optim
+
 from ..optimizer import AcceleratedOptimizer
 from ..scheduler import AcceleratedScheduler
+from .dataclasses import DistributedType
+from .imports import is_bnb_available
+from .versions import compare_versions
+
+
+def map_pytorch_optim_to_deepspeed(optimizer):
+    """
+    Args:
+        optimizer: torch.optim.Optimizer
+
+    Returns the DeepSeedCPUOptimizer (deepspeed.ops) version of the optimizer.
+    """
+
+    defaults = {k: v for k, v in optimizer.defaults.items() if k in ["lr", "weight_decay"]}
+
+    # Select the DeepSpeedCPUOptimizer based on the original optimizer class.
+    # DeepSpeedCPUAdam is the default
+    from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+    optimizer_class = DeepSpeedCPUAdam
+
+    # For DeepSpeedCPUAdam (adamw_mode)
+    if compare_versions("deepspeed", ">=", "0.3.1"):
+        defaults["adamw_mode"] = False
+        is_adaw = isinstance(optimizer, optim.AdamW)
+
+        if is_bnb_available() and not is_adaw:
+            import bitsandbytes.optim as bnb_opt
+
+            if isinstance(optimizer, (bnb_opt.AdamW, bnb_opt.AdamW32bit)):
+                try:
+                    is_adaw = optimizer.optim_bits == 32
+                except AttributeError:
+                    is_adaw = optimizer.args.optim_bits == 32
+            else:
+                is_adaw = False
+
+        if is_adaw:
+            defaults["adamw_mode"] = True
+
+    # For DeepSpeedCPUAdagrad
+    if compare_versions("deepspeed", ">=", "0.5.5"):
+        # Check if the optimizer is PyTorch's Adagrad.
+        is_ada = isinstance(optimizer, optim.Adagrad)
+        # If not, and bitsandbytes is available,
+        # # check if the optimizer is the 32-bit bitsandbytes Adagrad.
+        if is_bnb_available() and not is_ada:
+            import bitsandbytes.optim as bnb_opt
+
+            if isinstance(optimizer, (bnb_opt.Adagrad, bnb_opt.Adagrad32bit)):
+                try:
+                    is_ada = optimizer.optim_bits == 32
+                except AttributeError:
+                    is_ada = optimizer.args.optim_bits == 32
+        if is_ada:
+            from deepspeed.ops.adagrad import DeepSpeedCPUAdagrad
+
+            optimizer_class = DeepSpeedCPUAdagrad
+
+    # For DeepSpeedCPULion
+    if is_bnb_available(min_version="0.38.0") and compare_versions("deepspeed", ">=", "0.11.0"):
+        from bitsandbytes.optim import Lion, Lion32bit
+
+        if isinstance(optimizer, (Lion, Lion32bit)):
+            try:
+                is_bnb_32bits = optimizer.optim_bits == 32
+            except AttributeError:
+                is_bnb_32bits = optimizer.args.optim_bits == 32
+            if is_bnb_32bits:
+                from deepspeed.ops.lion import DeepSpeedCPULion
+
+                optimizer_class = DeepSpeedCPULion
+
+    return optimizer_class(optimizer.param_groups, **defaults)
+
+
+def get_active_deepspeed_plugin(state):
+    """
+    Returns the currently active DeepSpeedPlugin.
+
+    Raises:
+        ValueError: If DeepSpeed was not enabled and this function is called.
+    """
+    if state.distributed_type != DistributedType.DEEPSPEED:
+        raise ValueError(
+            "Couldn't retrieve the active `DeepSpeedPlugin` as none were enabled. "
+            "Please make sure that either `Accelerator` is configured for `deepspeed` "
+            "or make sure that the desired `DeepSpeedPlugin` has been enabled (`AcceleratorState().select_deepspeed_plugin(name)`) "
+            "before calling this function."
+        )
+    if not isinstance(state.deepspeed_plugins, dict):
+        return state.deepspeed_plugins
+    return next(plugin for plugin in state.deepspeed_plugins.values() if plugin.selected)
 
 
 class HfDeepSpeedConfig:
@@ -45,15 +139,15 @@ class HfDeepSpeedConfig:
             # modified it, it will not be accepted here again, since `auto` values would have been overridden
             config = deepcopy(config_file_or_dict)
         elif os.path.exists(config_file_or_dict):
-            with io.open(config_file_or_dict, "r", encoding="utf-8") as f:
+            with open(config_file_or_dict, encoding="utf-8") as f:
                 config = json.load(f)
         else:
             try:
                 config_decoded = base64.urlsafe_b64decode(config_file_or_dict).decode("utf-8")
                 config = json.loads(config_decoded)
-            except (UnicodeDecodeError, AttributeError):
+            except (UnicodeDecodeError, AttributeError, ValueError):
                 raise ValueError(
-                    f"Expected a string path to an existing deepspeed config, or a dictionary, or a base64 encoded string. Received: {config}"
+                    f"Expected a string path to an existing deepspeed config, or a dictionary, or a base64 encoded string. Received: {config_file_or_dict}"
                 )
 
         self.config = config
@@ -190,6 +284,7 @@ class DeepSpeedOptimizerWrapper(AcceleratedOptimizer):
 
     def __init__(self, optimizer):
         super().__init__(optimizer, device_placement=False, scaler=None)
+        self.__has_overflow__ = hasattr(self.optimizer, "overflow")
 
     def zero_grad(self, set_to_none=None):
         pass  # `accelerator.backward(loss)` is doing that automatically. Therefore, its implementation is not needed
@@ -200,7 +295,9 @@ class DeepSpeedOptimizerWrapper(AcceleratedOptimizer):
     @property
     def step_was_skipped(self):
         """Whether or not the optimizer step was done, or skipped because of gradient overflow."""
-        return self.optimizer.overflow
+        if self.__has_overflow__:
+            return self.optimizer.overflow
+        return False
 
 
 class DeepSpeedSchedulerWrapper(AcceleratedScheduler):
@@ -232,7 +329,7 @@ class DummyOptim:
             parameter groups
         weight_decay (float):
             Weight decay.
-        **kwargs:
+        **kwargs (additional keyword arguments, *optional*):
             Other arguments.
     """
 
@@ -251,16 +348,19 @@ class DummyScheduler:
     Args:
         optimizer (`torch.optim.optimizer.Optimizer`):
             The optimizer to wrap.
-        total_num_steps (int):
+        total_num_steps (int, *optional*):
             Total number of steps.
-        warmup_num_steps (int):
+        warmup_num_steps (int, *optional*):
             Number of steps for warmup.
-        **kwargs:
+        lr_scheduler_callable (callable, *optional*):
+            A callable function that creates an LR Scheduler. It accepts only one argument `optimizer`.
+        **kwargs (additional keyword arguments, *optional*):
             Other arguments.
     """
 
-    def __init__(self, optimizer, total_num_steps=None, warmup_num_steps=0, **kwargs):
+    def __init__(self, optimizer, total_num_steps=None, warmup_num_steps=0, lr_scheduler_callable=None, **kwargs):
         self.optimizer = optimizer
         self.total_num_steps = total_num_steps
         self.warmup_num_steps = warmup_num_steps
+        self.lr_scheduler_callable = lr_scheduler_callable
         self.kwargs = kwargs

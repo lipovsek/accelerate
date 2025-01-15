@@ -18,12 +18,25 @@ import re
 import shutil
 import tempfile
 import unittest
-from unittest import mock
+from pathlib import Path
+from unittest import mock, skip
 
 import torch
 
 from accelerate.test_utils.examples import compare_against_test
-from accelerate.test_utils.testing import TempDirTestCase, require_trackers, run_command, slow
+from accelerate.test_utils.testing import (
+    TempDirTestCase,
+    get_launch_command,
+    require_huggingface_suite,
+    require_multi_device,
+    require_multi_gpu,
+    require_non_xpu,
+    require_pippy,
+    require_schedulefree,
+    require_trackers,
+    run_command,
+    slow,
+)
 from accelerate.utils import write_basic_config
 
 
@@ -33,13 +46,21 @@ from accelerate.utils import write_basic_config
 
 EXCLUDE_EXAMPLES = [
     "cross_validation.py",
+    "checkpointing.py",
     "gradient_accumulation.py",
+    "local_sgd.py",
     "multi_process_metrics.py",
     "memory.py",
+    "schedule_free.py",
+    "tracking.py",
     "automatic_gradient_accumulation.py",
+    "gradient_accumulation_for_autoregressive_models.py",
     "fsdp_with_peak_mem_tracking.py",
     "deepspeed_with_config_support.py",
     "megatron_lm_gpt_pretraining.py",
+    "early_stopping.py",
+    "ddp_comm_hook.py",
+    "profiler.py",
 ]
 
 
@@ -63,6 +84,9 @@ class ExampleDifferenceTests(unittest.TestCase):
     etc (such as calls to `Accelerate.log()`)
     """
 
+    by_feature_path = Path("examples", "by_feature").resolve()
+    examples_path = Path("examples").resolve()
+
     def one_complete_example(
         self, complete_file_name: str, parser_only: bool, secondary_filename: str = None, special_strings: list = None
     ):
@@ -82,32 +106,30 @@ class ExampleDifferenceTests(unittest.TestCase):
                 diffs that are file specific, such as different logging variations between files.
         """
         self.maxDiff = None
-        by_feature_path = os.path.abspath(os.path.join("examples", "by_feature"))
-        examples_path = os.path.abspath("examples")
-        for item in os.listdir(by_feature_path):
+        for item in os.listdir(self.by_feature_path):
             if item not in EXCLUDE_EXAMPLES:
-                item_path = os.path.join(by_feature_path, item)
-                if os.path.isfile(item_path) and ".py" in item_path:
+                item_path = self.by_feature_path / item
+                if item_path.is_file() and item_path.suffix == ".py":
                     with self.subTest(
                         tested_script=complete_file_name,
                         feature_script=item,
                         tested_section="main()" if parser_only else "training_function()",
                     ):
                         diff = compare_against_test(
-                            os.path.join(examples_path, complete_file_name), item_path, parser_only, secondary_filename
+                            self.examples_path / complete_file_name, item_path, parser_only, secondary_filename
                         )
                         diff = "\n".join(diff)
                         if special_strings is not None:
                             for string in special_strings:
                                 diff = diff.replace(string, "")
-                        self.assertEqual(diff, "")
+                        assert diff == ""
 
     def test_nlp_examples(self):
         self.one_complete_example("complete_nlp_example.py", True)
         self.one_complete_example("complete_nlp_example.py", False)
 
     def test_cv_examples(self):
-        cv_path = os.path.abspath(os.path.join("examples", "cv_example.py"))
+        cv_path = (self.examples_path / "cv_example.py").resolve()
         special_strings = [
             " " * 16 + "{\n\n",
             " " * 20 + '"accuracy": eval_metric["accuracy"],\n\n',
@@ -117,12 +139,14 @@ class ExampleDifferenceTests(unittest.TestCase):
             " " * 16 + "},\n\n",
             " " * 16 + "step=epoch,\n",
             " " * 12,
+            " " * 8 + "for step, batch in enumerate(active_dataloader):\n",
         ]
         self.one_complete_example("complete_cv_example.py", True, cv_path, special_strings)
         self.one_complete_example("complete_cv_example.py", False, cv_path, special_strings)
 
 
 @mock.patch.dict(os.environ, {"TESTING_MOCKED_DATALOADERS": "1"})
+@require_huggingface_suite
 class FeatureExamplesTests(TempDirTestCase):
     clear_on_setup = False
 
@@ -130,10 +154,10 @@ class FeatureExamplesTests(TempDirTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls._tmpdir = tempfile.mkdtemp()
-        cls.configPath = os.path.join(cls._tmpdir, "default_config.yml")
+        cls.config_file = Path(cls._tmpdir) / "default_config.yml"
 
-        write_basic_config(save_location=cls.configPath)
-        cls._launch_args = ["accelerate", "launch", "--config_file", cls.configPath]
+        write_basic_config(save_location=cls.config_file)
+        cls.launch_args = get_launch_command(config_file=cls.config_file)
 
     @classmethod
     def tearDownClass(cls):
@@ -146,8 +170,8 @@ class FeatureExamplesTests(TempDirTestCase):
         --checkpointing_steps epoch
         --output_dir {self.tmpdir}
         """.split()
-        run_command(self._launch_args + testargs)
-        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "epoch_0")))
+        run_command(self.launch_args + testargs)
+        assert (self.tmpdir / "epoch_0").exists()
 
     def test_checkpointing_by_steps(self):
         testargs = f"""
@@ -155,34 +179,34 @@ class FeatureExamplesTests(TempDirTestCase):
         --checkpointing_steps 1
         --output_dir {self.tmpdir}
         """.split()
-        _ = run_command(self._launch_args + testargs)
-        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "step_2")))
+        _ = run_command(self.launch_args + testargs)
+        assert (self.tmpdir / "step_2").exists()
 
     def test_load_states_by_epoch(self):
         testargs = f"""
         examples/by_feature/checkpointing.py
-        --resume_from_checkpoint {os.path.join(self.tmpdir, "epoch_0")}
+        --resume_from_checkpoint {self.tmpdir / "epoch_0"}
         """.split()
-        output = run_command(self._launch_args + testargs, return_stdout=True)
-        self.assertNotIn("epoch 0:", output)
-        self.assertIn("epoch 1:", output)
+        output = run_command(self.launch_args + testargs, return_stdout=True)
+        assert "epoch 0:" not in output
+        assert "epoch 1:" in output
 
     def test_load_states_by_steps(self):
         testargs = f"""
         examples/by_feature/checkpointing.py
-        --resume_from_checkpoint {os.path.join(self.tmpdir, "step_2")}
+        --resume_from_checkpoint {self.tmpdir / "step_2"}
         """.split()
-        output = run_command(self._launch_args + testargs, return_stdout=True)
+        output = run_command(self.launch_args + testargs, return_stdout=True)
         if torch.cuda.is_available():
             num_processes = torch.cuda.device_count()
         else:
             num_processes = 1
         if num_processes > 1:
-            self.assertNotIn("epoch 0:", output)
-            self.assertIn("epoch 1:", output)
+            assert "epoch 0:" not in output
+            assert "epoch 1:" in output
         else:
-            self.assertIn("epoch 0:", output)
-            self.assertIn("epoch 1:", output)
+            assert "epoch 0:" in output
+            assert "epoch 1:" in output
 
     @slow
     def test_cross_validation(self):
@@ -191,26 +215,85 @@ class FeatureExamplesTests(TempDirTestCase):
         --num_folds 2
         """.split()
         with mock.patch.dict(os.environ, {"TESTING_MOCKED_DATALOADERS": "0"}):
-            output = run_command(self._launch_args + testargs, return_stdout=True)
-            results = ast.literal_eval(re.findall("({.+})", output)[-1])
-            self.assertGreaterEqual(results["accuracy"], 0.75)
+            output = run_command(self.launch_args + testargs, return_stdout=True)
+            results = re.findall("({.+})", output)
+            results = [r for r in results if "accuracy" in r][-1]
+            results = ast.literal_eval(results)
+            assert results["accuracy"] >= 0.75
 
     def test_multi_process_metrics(self):
         testargs = ["examples/by_feature/multi_process_metrics.py"]
-        run_command(self._launch_args + testargs)
+        run_command(self.launch_args + testargs)
+
+    @require_schedulefree
+    def test_schedulefree(self):
+        testargs = ["examples/by_feature/schedule_free.py"]
+        run_command(self.launch_args + testargs)
 
     @require_trackers
-    @mock.patch.dict(os.environ, {"WANDB_MODE": "offline"})
+    @mock.patch.dict(os.environ, {"WANDB_MODE": "offline", "DVCLIVE_TEST": "true"})
     def test_tracking(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             testargs = f"""
             examples/by_feature/tracking.py
             --with_tracking
-            --logging_dir {tmpdir}
+            --project_dir {tmpdir}
             """.split()
-            run_command(self._launch_args + testargs)
-            self.assertTrue(os.path.exists(os.path.join(tmpdir, "tracking")))
+            run_command(self.launch_args + testargs)
+            assert os.path.exists(os.path.join(tmpdir, "tracking"))
 
     def test_gradient_accumulation(self):
         testargs = ["examples/by_feature/gradient_accumulation.py"]
-        run_command(self._launch_args + testargs)
+        run_command(self.launch_args + testargs)
+
+    def test_gradient_accumulation_for_autoregressive_models(self):
+        testargs = [
+            "examples/by_feature/gradient_accumulation_for_autoregressive_models.py",
+            "--gradient_accumulation_steps",
+            "2",
+        ]
+        run_command(self.launch_args + testargs)
+
+    def test_local_sgd(self):
+        testargs = ["examples/by_feature/local_sgd.py"]
+        run_command(self.launch_args + testargs)
+
+    def test_early_stopping(self):
+        testargs = ["examples/by_feature/early_stopping.py"]
+        run_command(self.launch_args + testargs)
+
+    def test_profiler(self):
+        testargs = ["examples/by_feature/profiler.py"]
+        run_command(self.launch_args + testargs)
+
+    @require_multi_device
+    def test_ddp_comm_hook(self):
+        testargs = ["examples/by_feature/ddp_comm_hook.py", "--ddp_comm_hook", "fp16"]
+        run_command(self.launch_args + testargs)
+
+    @skip(
+        reason="stable-diffusion-v1-5 is no longer available. Potentially `Comfy-Org/stable-diffusion-v1-5-archive` once diffusers support is added."
+    )
+    @require_multi_device
+    def test_distributed_inference_examples_stable_diffusion(self):
+        testargs = ["examples/inference/distributed/stable_diffusion.py"]
+        run_command(self.launch_args + testargs)
+
+    @require_multi_device
+    def test_distributed_inference_examples_phi2(self):
+        testargs = ["examples/inference/distributed/phi2.py"]
+        run_command(self.launch_args + testargs)
+
+    @require_non_xpu
+    @require_pippy
+    @require_multi_gpu
+    def test_pippy_examples_bert(self):
+        testargs = ["examples/inference/pippy/bert.py"]
+        run_command(self.launch_args + testargs)
+
+    @require_non_xpu
+    @require_pippy
+    @require_multi_gpu
+    def test_pippy_examples_gpt2(self):
+        testargs = ["examples/inference/pippy/gpt2.py"]
+        run_command(self.launch_args + testargs)

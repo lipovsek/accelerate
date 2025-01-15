@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2022 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +14,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 
 import evaluate
 import torch
@@ -61,7 +61,7 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 16, model_name: 
 
     def collate_fn(examples):
         # On TPU it's best to pad everything to the same length or training will be very slow.
-        if accelerator.distributed_type == DistributedType.TPU:
+        if accelerator.distributed_type == DistributedType.XLA:
             return tokenizer.pad(examples, padding="max_length", max_length=128, return_tensors="pt")
         return tokenizer.pad(examples, padding="longest", return_tensors="pt")
 
@@ -102,15 +102,10 @@ def training_function(config, args):
     )
     optimizer = optimizer_cls(params=model.parameters(), lr=lr)
 
-    if accelerator.state.deepspeed_plugin is not None:
-        gradient_accumulation_steps = accelerator.state.deepspeed_plugin.deepspeed_config[
-            "gradient_accumulation_steps"
-        ]
-    else:
-        gradient_accumulation_steps = 1
-    max_training_steps = (len(train_dataloader) * num_epochs) // gradient_accumulation_steps
+    max_training_steps = len(train_dataloader) * num_epochs
 
     # Instantiate scheduler
+    linear_decay_scheduler = False
     if (
         accelerator.state.deepspeed_plugin is None
         or "scheduler" not in accelerator.state.deepspeed_plugin.deepspeed_config
@@ -120,6 +115,7 @@ def training_function(config, args):
             num_warmup_steps=0,
             num_training_steps=max_training_steps,
         )
+        linear_decay_scheduler = True
     else:
         lr_scheduler = DummyScheduler(optimizer, total_num_steps=max_training_steps, warmup_num_steps=0)
 
@@ -130,8 +126,6 @@ def training_function(config, args):
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
-    # We need to keep track of how many total steps we have iterated over
-    overall_step = 0
     # We also need to keep track of the stating epoch so files are named properly
     starting_epoch = 0
 
@@ -139,19 +133,32 @@ def training_function(config, args):
     metric = evaluate.load("glue", "mrpc")
     best_performance = 0
     performance_metric = {}
+    expected_lr_after_first_optim_step = lr * (
+        1 - 1 / (max_training_steps / accelerator.num_processes / accelerator.gradient_accumulation_steps)
+    )
+    lr_scheduler_check_completed = False
     for epoch in range(starting_epoch, num_epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
-            outputs = model(**batch)
-            loss = outputs.loss
-            loss = loss / gradient_accumulation_steps
-            accelerator.backward(loss)
-            if step % gradient_accumulation_steps == 0:
+            with accelerator.accumulate(model):
+                outputs = model(**batch)
+                loss = outputs.loss
+                accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            overall_step += 1
+                # assert the learning rate after first optimizer step
+                if (
+                    accelerator.sync_gradients
+                    and not lr_scheduler_check_completed
+                    and linear_decay_scheduler
+                    and accelerator.state.mixed_precision == "no"
+                ):
+                    assert (
+                        lr_scheduler.get_last_lr()[0] == expected_lr_after_first_optim_step
+                    ), f"Wrong lr found at second step, expected {expected_lr_after_first_optim_step}, got {lr_scheduler.get_last_lr()[0]}"
+                    lr_scheduler_check_completed = True
 
         model.eval()
         samples_seen = 0
@@ -184,6 +191,12 @@ def training_function(config, args):
         if best_performance < eval_metric["accuracy"]:
             best_performance = eval_metric["accuracy"]
 
+    # check that the LR is 0
+    if linear_decay_scheduler and accelerator.state.mixed_precision == "no":
+        assert (
+            lr_scheduler.get_last_lr()[0] == 0
+        ), f"Wrong lr found at last step, expected 0, got {lr_scheduler.get_last_lr()[0]}"
+
     if args.performance_lower_bound is not None:
         assert (
             args.performance_lower_bound <= best_performance
@@ -193,6 +206,14 @@ def training_function(config, args):
     if accelerator.is_main_process:
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump(performance_metric, f)
+
+    # Finally try saving the model
+    accelerator.save_model(model, args.output_dir)
+    accelerator.wait_for_everyone()
+    assert Path(
+        args.output_dir, "model.safetensors"
+    ).exists(), "Model was not saved when calling `Accelerator.save_model`"
+    accelerator.end_training()
 
 
 def main():

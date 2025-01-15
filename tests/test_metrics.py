@@ -12,33 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
-import os
 import unittest
 
-import torch
+import numpy as np
+from packaging import version
 
-import accelerate
 from accelerate import debug_launcher
 from accelerate.test_utils import (
+    DEFAULT_LAUNCH_COMMAND,
+    device_count,
     execute_subprocess_async,
+    path_in_accelerate_package,
     require_cpu,
     require_huggingface_suite,
-    require_multi_gpu,
-    require_single_gpu,
-    require_torch_min_version,
+    require_multi_device,
+    require_single_device,
 )
-from accelerate.utils import get_launch_prefix, patch_environment
+from accelerate.utils import patch_environment
 
 
 @require_huggingface_suite
-@require_torch_min_version(version="1.8.0")
+@unittest.skipIf(version.parse(np.__version__) >= version.parse("2.0"), "Test requires numpy version < 2.0")
 class MetricTester(unittest.TestCase):
     def setUp(self):
-        mod_file = inspect.getfile(accelerate.test_utils)
-        self.test_file_path = os.path.sep.join(
-            mod_file.split(os.path.sep)[:-1] + ["scripts", "external_deps", "test_metrics.py"]
-        )
+        self.test_file_path = path_in_accelerate_package("test_utils", "scripts", "external_deps", "test_metrics.py")
 
         from accelerate.test_utils.scripts.external_deps import test_metrics  # noqa: F401
 
@@ -52,13 +49,13 @@ class MetricTester(unittest.TestCase):
     def test_metric_cpu_multi(self):
         debug_launcher(self.test_metrics.main)
 
-    @require_single_gpu
-    def test_metric_gpu(self):
+    @require_single_device
+    def test_metric_accelerator(self):
         self.test_metrics.main()
 
-    @require_multi_gpu
-    def test_metric_gpu_multi(self):
-        print(f"Found {torch.cuda.device_count()} devices.")
-        cmd = get_launch_prefix() + [f"--nproc_per_node={torch.cuda.device_count()}", self.test_file_path]
-        with patch_environment(omp_num_threads=1):
-            execute_subprocess_async(cmd, env=os.environ.copy())
+    @require_multi_device
+    def test_metric_accelerator_multi(self):
+        print(f"Found {device_count} devices.")
+        cmd = DEFAULT_LAUNCH_COMMAND + [self.test_file_path]
+        with patch_environment(omp_num_threads=1, ACCELERATE_LOG_LEVEL="INFO"):
+            execute_subprocess_async(cmd)

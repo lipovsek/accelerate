@@ -22,12 +22,12 @@ from typing import List, Optional, Union
 
 import yaml
 
-from ...utils import ComputeEnvironment, DistributedType, DynamoBackend, SageMakerDistributedType
+from ...utils import ComputeEnvironment, DistributedType, SageMakerDistributedType
 from ...utils.constants import SAGEMAKER_PYTHON_VERSION, SAGEMAKER_PYTORCH_VERSION, SAGEMAKER_TRANSFORMERS_VERSION
 
 
 hf_cache_home = os.path.expanduser(
-    os.getenv("HF_HOME", os.path.join(os.getenv("XDG_CACHE_HOME", "~/.cache"), "huggingface"))
+    os.environ.get("HF_HOME", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "huggingface"))
 )
 cache_dir = os.path.join(hf_cache_home, "accelerate")
 default_json_config_file = os.path.join(cache_dir, "default_config.yaml")
@@ -45,13 +45,13 @@ def load_config_from_file(config_file):
         if not os.path.isfile(config_file):
             raise FileNotFoundError(
                 f"The passed configuration file `{config_file}` does not exist. "
-                "Please pass an existing file to `accelerate launch`, or use the the default one "
+                "Please pass an existing file to `accelerate launch`, or use the default one "
                 "created through `accelerate config` and run `accelerate launch` "
                 "without the `--config_file` argument."
             )
     else:
         config_file = default_config_file
-    with open(config_file, "r", encoding="utf-8") as f:
+    with open(config_file, encoding="utf-8") as f:
         if config_file.endswith(".json"):
             if (
                 json.load(f).get("compute_environment", ComputeEnvironment.LOCAL_MACHINE)
@@ -78,32 +78,66 @@ class BaseConfig:
     distributed_type: Union[DistributedType, SageMakerDistributedType]
     mixed_precision: str
     use_cpu: bool
-    dynamo_backend: DynamoBackend
+    debug: bool
 
     def to_dict(self):
         result = self.__dict__
         # For serialization, it's best to convert Enums to strings (or their underlying value type).
-        for key, value in result.items():
+
+        def _convert_enums(value):
             if isinstance(value, Enum):
-                result[key] = value.value
+                return value.value
+            if isinstance(value, dict):
+                if not bool(value):
+                    return None
+                for key1, value1 in value.items():
+                    value[key1] = _convert_enums(value1)
+            return value
+
+        for key, value in result.items():
+            result[key] = _convert_enums(value)
         result = {k: v for k, v in result.items() if v is not None}
         return result
 
-    @classmethod
-    def from_json_file(cls, json_file=None):
-        json_file = default_json_config_file if json_file is None else json_file
-        with open(json_file, "r", encoding="utf-8") as f:
-            config_dict = json.load(f)
+    @staticmethod
+    def process_config(config_dict):
+        """
+        Processes `config_dict` and sets default values for any missing keys
+        """
         if "compute_environment" not in config_dict:
             config_dict["compute_environment"] = ComputeEnvironment.LOCAL_MACHINE
+        if "distributed_type" not in config_dict:
+            raise ValueError("A `distributed_type` must be specified in the config file.")
+        if "num_processes" not in config_dict and config_dict["distributed_type"] == DistributedType.NO:
+            config_dict["num_processes"] = 1
         if "mixed_precision" not in config_dict:
             config_dict["mixed_precision"] = "fp16" if ("fp16" in config_dict and config_dict["fp16"]) else None
         if "fp16" in config_dict:  # Convert the config to the new format.
             del config_dict["fp16"]
+        if "dynamo_backend" in config_dict:  # Convert the config to the new format.
+            dynamo_backend = config_dict.pop("dynamo_backend")
+            config_dict["dynamo_config"] = {} if dynamo_backend == "NO" else {"dynamo_backend": dynamo_backend}
         if "use_cpu" not in config_dict:
             config_dict["use_cpu"] = False
-        if "dynamo_backend" not in config_dict:
-            config_dict["dynamo_backend"] = DynamoBackend.NO
+        if "debug" not in config_dict:
+            config_dict["debug"] = False
+        if "enable_cpu_affinity" not in config_dict:
+            config_dict["enable_cpu_affinity"] = False
+        return config_dict
+
+    @classmethod
+    def from_json_file(cls, json_file=None):
+        json_file = default_json_config_file if json_file is None else json_file
+        with open(json_file, encoding="utf-8") as f:
+            config_dict = json.load(f)
+        config_dict = cls.process_config(config_dict)
+        extra_keys = sorted(set(config_dict.keys()) - set(cls.__dataclass_fields__.keys()))
+        if len(extra_keys) > 0:
+            raise ValueError(
+                f"The config file at {json_file} had unknown keys ({extra_keys}), please try upgrading your `accelerate`"
+                " version or fix (and potentially remove) these keys from your config file."
+            )
+
         return cls(**config_dict)
 
     def to_json_file(self, json_file):
@@ -114,20 +148,15 @@ class BaseConfig:
     @classmethod
     def from_yaml_file(cls, yaml_file=None):
         yaml_file = default_yaml_config_file if yaml_file is None else yaml_file
-        with open(yaml_file, "r", encoding="utf-8") as f:
+        with open(yaml_file, encoding="utf-8") as f:
             config_dict = yaml.safe_load(f)
-        if "compute_environment" not in config_dict:
-            config_dict["compute_environment"] = ComputeEnvironment.LOCAL_MACHINE
-
-        if "mixed_precision" not in config_dict:
-            config_dict["mixed_precision"] = "fp16" if ("fp16" in config_dict and config_dict["fp16"]) else None
-        if "fp16" in config_dict:  # Convert the config to the new format.
-            del config_dict["fp16"]
-        if "use_cpu" not in config_dict:
-            config_dict["use_cpu"] = False
-        if "dynamo_backend" not in config_dict:
-            config_dict["dynamo_backend"] = DynamoBackend.NO
-
+        config_dict = cls.process_config(config_dict)
+        extra_keys = sorted(set(config_dict.keys()) - set(cls.__dataclass_fields__.keys()))
+        if len(extra_keys) > 0:
+            raise ValueError(
+                f"The config file at {yaml_file} had unknown keys ({extra_keys}), please try upgrading your `accelerate`"
+                " version or fix (and potentially remove) these keys from your config file."
+            )
         return cls(**config_dict)
 
     def to_yaml_file(self, yaml_file):
@@ -142,13 +171,13 @@ class BaseConfig:
                 self.distributed_type = SageMakerDistributedType(self.distributed_type)
             else:
                 self.distributed_type = DistributedType(self.distributed_type)
-        if isinstance(self.dynamo_backend, str):
-            self.dynamo_backend = DynamoBackend(self.dynamo_backend.upper())
+        if getattr(self, "dynamo_config", None) is None:
+            self.dynamo_config = {}
 
 
 @dataclass
 class ClusterConfig(BaseConfig):
-    num_processes: int
+    num_processes: int = -1  # For instance if we use SLURM and the user manually passes it in
     machine_rank: int = 0
     num_machines: int = 1
     gpu_ids: Optional[str] = None
@@ -157,13 +186,20 @@ class ClusterConfig(BaseConfig):
     rdzv_backend: Optional[str] = "static"
     same_network: Optional[bool] = False
     main_training_function: str = "main"
+    enable_cpu_affinity: bool = False
 
+    # args for FP8 training
+    fp8_config: dict = None
     # args for deepspeed_plugin
     deepspeed_config: dict = None
     # args for fsdp
     fsdp_config: dict = None
     # args for megatron_lm
     megatron_lm_config: dict = None
+    # args for ipex
+    ipex_config: dict = None
+    # args for mpirun
+    mpirun_config: dict = None
     # args for TPU
     downcast_bf16: bool = False
 
@@ -177,6 +213,9 @@ class ClusterConfig(BaseConfig):
     tpu_vm: List[str] = None
     tpu_env: List[str] = None
 
+    # args for dynamo
+    dynamo_config: dict = None
+
     def __post_init__(self):
         if self.deepspeed_config is None:
             self.deepspeed_config = {}
@@ -184,6 +223,12 @@ class ClusterConfig(BaseConfig):
             self.fsdp_config = {}
         if self.megatron_lm_config is None:
             self.megatron_lm_config = {}
+        if self.ipex_config is None:
+            self.ipex_config = {}
+        if self.mpirun_config is None:
+            self.mpirun_config = {}
+        if self.fp8_config is None:
+            self.fp8_config = {}
         return super().__post_init__()
 
 
@@ -203,3 +248,5 @@ class SageMakerConfig(BaseConfig):
     sagemaker_inputs_file: str = None
     sagemaker_metrics_file: str = None
     additional_args: dict = None
+    dynamo_config: dict = None
+    enable_cpu_affinity: bool = False

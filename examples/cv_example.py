@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -181,6 +180,7 @@ def training_function(config, args):
         eval_metric = accurate.item() / num_elems
         # Use accelerator.print to print only on the main process.
         accelerator.print(f"epoch {epoch}: {100 * eval_metric:.2f}")
+    accelerator.end_training()
 
 
 def main():
@@ -190,7 +190,7 @@ def main():
         "--mixed_precision",
         type=str,
         default=None,
-        choices=["no", "fp16", "bf16"],
+        choices=["no", "fp16", "bf16", "fp8"],
         help="Whether to use mixed precision. Choose"
         "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
         "and an Nvidia Ampere GPU.",

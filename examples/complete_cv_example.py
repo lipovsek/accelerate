@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,7 +23,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import Compose, RandomResizedCrop, Resize, ToTensor
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 
 
 ########################################################################
@@ -73,12 +72,19 @@ class PetsDataset(Dataset):
 
 def training_function(config, args):
     # Initialize accelerator
+    dataloader_config = DataLoaderConfiguration(use_stateful_dataloader=args.use_stateful_dataloader)
     if args.with_tracking:
         accelerator = Accelerator(
-            cpu=args.cpu, mixed_precision=args.mixed_precision, log_with="all", logging_dir=args.logging_dir
+            cpu=args.cpu,
+            mixed_precision=args.mixed_precision,
+            log_with="all",
+            project_dir=args.project_dir,
+            dataloader_config=dataloader_config,
         )
     else:
-        accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision)
+        accelerator = Accelerator(
+            cpu=args.cpu, mixed_precision=args.mixed_precision, dataloader_config=dataloader_config
+        )
 
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
@@ -205,9 +211,12 @@ def training_function(config, args):
             total_loss = 0
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
             # We need to skip steps until we reach the resumed step
-            train_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+            active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
             overall_step += resume_step
-        for batch in train_dataloader:
+        else:
+            # After the first iteration though, we need to go back to the original dataloader
+            active_dataloader = train_dataloader
+        for batch in active_dataloader:
             # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch = {k: v.to(accelerator.device) for k, v in batch.items()}
             inputs = (batch["image"] - mean) / std
@@ -260,8 +269,7 @@ def training_function(config, args):
                 output_dir = os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir)
 
-    if args.with_tracking:
-        accelerator.end_training()
+    accelerator.end_training()
 
 
 def main():
@@ -272,7 +280,7 @@ def main():
         "--mixed_precision",
         type=str,
         default=None,
-        choices=["no", "fp16", "bf16"],
+        choices=["no", "fp16", "bf16", "fp8"],
         help="Whether to use mixed precision. Choose"
         "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
         "and an Nvidia Ampere GPU.",
@@ -297,15 +305,20 @@ def main():
         help="If the training should continue from a checkpoint folder.",
     )
     parser.add_argument(
+        "--use_stateful_dataloader",
+        action="store_true",
+        help="If the dataloader should be a resumable stateful dataloader.",
+    )
+    parser.add_argument(
         "--with_tracking",
         action="store_true",
         help="Whether to load in all available experiment trackers from the environment and use them for logging.",
     )
     parser.add_argument(
-        "--logging_dir",
+        "--project_dir",
         type=str,
         default="logs",
-        help="Location on where to store experiment tracking logs`",
+        help="Location on where to store experiment tracking logs` and relevent project information",
     )
     args = parser.parse_args()
     config = {"lr": 3e-2, "num_epochs": 3, "seed": 42, "batch_size": 64, "image_size": 224}

@@ -14,10 +14,9 @@
 
 import unittest
 
-import torch
 from torch import nn
 
-from accelerate.test_utils import require_cuda
+from accelerate.test_utils import memory_allocated_func, require_non_cpu, require_non_torch_xla, torch_device
 from accelerate.utils.memory import find_executable_batch_size, release_memory
 
 
@@ -48,7 +47,7 @@ class MemoryTest(unittest.TestCase):
                 raise_fake_out_of_memory()
 
         mock_training_loop_function()
-        self.assertListEqual(batch_sizes, [128, 64, 32, 16, 8])
+        assert batch_sizes == [128, 64, 32, 16, 8]
 
     def test_memory_explicit(self):
         batch_sizes = []
@@ -62,8 +61,8 @@ class MemoryTest(unittest.TestCase):
             return batch_size, arg1
 
         bs, arg1 = mock_training_loop_function("hello")
-        self.assertListEqual(batch_sizes, [128, 64, 32, 16, 8])
-        self.assertListEqual([bs, arg1], [8, "hello"])
+        assert batch_sizes == [128, 64, 32, 16, 8]
+        assert [bs, arg1] == [8, "hello"]
 
     def test_start_zero(self):
         @find_executable_batch_size(starting_batch_size=0)
@@ -72,7 +71,7 @@ class MemoryTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError) as cm:
             mock_training_loop_function()
-            self.assertIn("No executable batch size found, reached zero.", cm.exception.args[0])
+            assert "No executable batch size found, reached zero." in cm.exception.args[0]
 
     def test_approach_zero(self):
         @find_executable_batch_size(starting_batch_size=16)
@@ -83,7 +82,7 @@ class MemoryTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError) as cm:
             mock_training_loop_function()
-            self.assertIn("No executable batch size found, reached zero.", cm.exception.args[0])
+            assert "No executable batch size found, reached zero." in cm.exception.args[0]
 
     def test_verbose_guard(self):
         @find_executable_batch_size(starting_batch_size=128)
@@ -93,8 +92,8 @@ class MemoryTest(unittest.TestCase):
 
         with self.assertRaises(TypeError) as cm:
             mock_training_loop_function(128, "hello", "world")
-            self.assertIn("Batch size was passed into `f`", cm.exception.args[0])
-            self.assertIn("`f(arg1='hello', arg2='world')", cm.exception.args[0])
+            assert "Batch size was passed into `f`" in cm.exception.args[0]
+            assert "`f(arg1='hello', arg2='world')" in cm.exception.args[0]
 
     def test_any_other_error(self):
         @find_executable_batch_size(starting_batch_size=16)
@@ -103,13 +102,14 @@ class MemoryTest(unittest.TestCase):
 
         with self.assertRaises(ValueError) as cm:
             mock_training_loop_function()
-            self.assertIn("Oops, we had an error!", cm.exception.args[0])
+            assert "Oops, we had an error!" in cm.exception.args[0]
 
-    @require_cuda
+    @require_non_cpu
+    @require_non_torch_xla
     def test_release_memory(self):
-        self.assertEqual(torch.cuda.memory_allocated(), 0)
+        starting_memory = memory_allocated_func()
         model = ModelForTest()
-        model.cuda()
-        self.assertGreater(torch.cuda.memory_allocated(), 0)
+        model.to(torch_device)
+        assert memory_allocated_func() > starting_memory
         model = release_memory(model)
-        self.assertEqual(torch.cuda.memory_allocated(), 0)
+        assert memory_allocated_func() == starting_memory

@@ -14,16 +14,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import pickle
+import tempfile
 import warnings
 from typing import List
 from unittest.mock import Mock
 
 import torch
-from torch.utils.data import DataLoader, IterableDataset, TensorDataset
+from torch.utils.data import (
+    BatchSampler,
+    DataLoader,
+    Dataset,
+    IterableDataset,
+    RandomSampler,
+    TensorDataset,
+    default_collate,
+)
 
-from accelerate.accelerator import Accelerator
+from accelerate.accelerator import Accelerator, DataLoaderConfiguration
 from accelerate.utils.dataclasses import DistributedType
+
+
+NUM_ELEMENTS = 22
+NUM_WORKERS = 4
+BATCH_SIZE = 4
+
+
+class DummyDataset(Dataset):
+    def __len__(self):
+        return NUM_ELEMENTS
+
+    def __getitem__(self, index):
+        squeeze = False
+
+        if isinstance(index, int):
+            index = [index]
+            squeeze = True
+        elif isinstance(index, slice):
+            index = list(range(*index.indices(self.size)))
+        else:
+            index = list(index)
+
+        batch = [{"index": i, "label": i % 2, "random_augmentation": torch.rand(1).item()} for i in index]
+
+        if squeeze:
+            batch = batch[0]
+
+        return batch
 
 
 class DummyIterableDataset(IterableDataset):
@@ -31,22 +68,27 @@ class DummyIterableDataset(IterableDataset):
         self.data = data
 
     def __iter__(self):
-        for element in self.data:
-            yield element
+        yield from self.data
 
 
 def create_accelerator(even_batches=True):
-    accelerator = Accelerator(even_batches=even_batches)
+    dataloader_config = DataLoaderConfiguration(even_batches=even_batches)
+    accelerator = Accelerator(dataloader_config=dataloader_config)
     assert accelerator.num_processes == 2, "this script expects that two GPUs are available"
     return accelerator
 
 
-def create_dataloader(accelerator: Accelerator, dataset_size: int, batch_size: int, iterable: bool = False):
+def create_dataloader(
+    accelerator: Accelerator, dataset_size: int, batch_size: int, iterable: bool = False, shuffle: bool = False
+):
     """
     Create a simple DataLoader to use during the test cases
     """
+    values = torch.as_tensor(range(dataset_size))
+    if shuffle:
+        values = values[torch.randperm(values.size(0))]
     if iterable:
-        dataset = DummyIterableDataset(torch.as_tensor(range(dataset_size)))
+        dataset = DummyIterableDataset(values)
     else:
         dataset = TensorDataset(torch.as_tensor(range(dataset_size)))
 
@@ -206,8 +248,112 @@ def test_join_raises_warning_for_iterable_when_overriding_even_batches():
         assert "only supported for map-style datasets" in str(w[-1].message)
 
 
+def test_pickle_accelerator():
+    accelerator = create_accelerator()
+    data_loader = create_dataloader(accelerator, dataset_size=32, batch_size=4)
+    _ = accelerator.prepare(data_loader)
+    pickled_accelerator = pickle.dumps(accelerator)
+    unpickled_accelerator = pickle.loads(pickled_accelerator)
+    # TODO: Maybe this should be implemented as __eq__ for AcceleratorState?
+    assert accelerator.state.__dict__ == unpickled_accelerator.state.__dict__
+
+
+def test_data_loader(data_loader, accelerator):
+    # Prepare the DataLoader
+    data_loader = accelerator.prepare(data_loader)
+
+    all_examples = []
+    for i, batch in enumerate(data_loader):
+        index, _ = accelerator.gather_for_metrics((batch["index"], batch["label"]))
+        all_examples.extend(index.detach().cpu().numpy().tolist())
+
+    # Sort the examples
+    sorted_all_examples = sorted(all_examples)
+
+    # Check if all elements are present in the sorted list of iterated samples
+    assert (
+        len(set(sorted_all_examples)) == NUM_ELEMENTS
+    ), "Not all the dataset elements have been iterated in an epoch due to duplication of samples across processes."
+
+
+def test_stateful_dataloader(accelerator):
+    """
+    Tests that a stateful dataloader can be iterated over, saved after a few batches using `load_state_dict`, and then
+    resumed from the saved state.
+
+    The result should be the same as the rest of the data that iterated over after saving.
+    """
+    old_dataloader_config = accelerator.dataloader_config
+    try:
+        accelerator.dataloader_config = DataLoaderConfiguration(use_stateful_dataloader=True)
+        prepared_dl = create_dataloader(
+            accelerator, dataset_size=32 * accelerator.num_processes, batch_size=4, iterable=True, shuffle=True
+        )
+        untrained_batches = []
+        # Calculate what step that will be
+        total_batches = 32 * accelerator.num_processes // (4 * accelerator.num_processes)
+        last_batch_num = total_batches - 1
+        for step, batch in enumerate(prepared_dl):
+            # Step just before
+            if step == last_batch_num - 1:
+                state_dict = prepared_dl.state_dict()
+            if step >= last_batch_num:
+                # Otherwise grab the "unseen" batches
+                untrained_batches.append(batch)
+        not_skipped_batches = accelerator.gather(untrained_batches)
+        prepared_dl.load_state_dict(state_dict)
+        resumed_batches = []
+        for batch in prepared_dl:
+            resumed_batches.append(batch)
+        resumed_batches = accelerator.gather(resumed_batches)
+        for b1, b2 in zip(not_skipped_batches, resumed_batches):
+            for v1, v2 in zip(b1, b2):
+                assert torch.equal(v1, v2), f"Batch {b1} and {b2} are not equal"
+    finally:
+        accelerator.dataloader_config = old_dataloader_config
+
+
+def test_stateful_dataloader_save_state(accelerator):
+    """
+    Tests that a stateful dataloader can be iterated over, saved after a few batches using `Accelerator.save_state`,
+    and then resumed from the saved state.
+
+    The result should be the same as the rest of the data that iterated over after saving.
+    """
+    old_dataloader_config = accelerator.dataloader_config
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            accelerator.dataloader_config = DataLoaderConfiguration(use_stateful_dataloader=True)
+            prepared_dl = create_dataloader(
+                accelerator, dataset_size=32 * accelerator.num_processes, batch_size=4, iterable=True, shuffle=True
+            )
+            untrained_batches = []
+            # Calculate what step that will be
+            total_batches = 32 * accelerator.num_processes // (4 * accelerator.num_processes)
+            last_batch_num = total_batches - 1
+            for step, batch in enumerate(prepared_dl):
+                # Step just before
+                if step == last_batch_num - 1:
+                    accelerator.save_state(tmpdir)
+                if step >= last_batch_num:
+                    # Otherwise grab the "unseen" batches
+                    untrained_batches.append(batch)
+            not_skipped_batches = accelerator.gather(untrained_batches)
+            accelerator.load_state(tmpdir)
+            resumed_batches = []
+            for batch in prepared_dl:
+                resumed_batches.append(batch)
+            resumed_batches = accelerator.gather(resumed_batches)
+            for b1, b2 in zip(not_skipped_batches, resumed_batches):
+                for v1, v2 in zip(b1, b2):
+                    assert torch.equal(v1, v2), f"Batch {b1} and {b2} are not equal"
+    finally:
+        accelerator.dataloader_config = old_dataloader_config
+
+
 def main():
     accelerator = create_accelerator()
+    torch.manual_seed(accelerator.process_index)
 
     accelerator.print("Test that even_batches variable ensures uniform batches across processes")
     test_default_ensures_even_batch_sizes()
@@ -232,6 +378,32 @@ def main():
     accelerator.state.distributed_type = DistributedType.FSDP
     test_join_raises_warning_for_non_ddp_distributed(accelerator)
     accelerator.state.distributed_type = original_state
+
+    accelerator.print("Test pickling an accelerator")
+    test_pickle_accelerator()
+
+    dataset = DummyDataset()
+    # Conventional Dataloader with shuffle=False
+    loader = DataLoader(dataset, shuffle=False, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
+    test_data_loader(loader, accelerator)
+
+    # Conventional Dataloader with shuffle=True
+    loader = DataLoader(dataset, shuffle=True, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
+    test_data_loader(loader, accelerator)
+
+    # Dataloader with batch_sampler
+    sampler = BatchSampler(RandomSampler(dataset), batch_size=BATCH_SIZE, drop_last=False)
+    loader = DataLoader(dataset, batch_sampler=sampler, num_workers=NUM_WORKERS)
+    test_data_loader(loader, accelerator)
+
+    # Dataloader with sampler as an instance of `BatchSampler`
+    sampler = BatchSampler(RandomSampler(dataset), batch_size=BATCH_SIZE, drop_last=False)
+    loader = DataLoader(dataset, sampler=sampler, batch_size=None, collate_fn=default_collate, num_workers=NUM_WORKERS)
+    test_data_loader(loader, accelerator)
+    test_stateful_dataloader(accelerator)
+    test_stateful_dataloader_save_state(accelerator)
+
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

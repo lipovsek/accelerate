@@ -20,10 +20,7 @@ import logging
 import os
 import subprocess
 import sys
-import warnings
-from ast import literal_eval
 from pathlib import Path
-from typing import Dict, List
 
 import psutil
 import torch
@@ -31,24 +28,33 @@ import torch
 from accelerate.commands.config import default_config_file, load_config_from_file
 from accelerate.commands.config.config_args import SageMakerConfig
 from accelerate.commands.config.config_utils import DYNAMO_BACKENDS
+from accelerate.commands.utils import CustomArgumentParser
 from accelerate.state import get_int_from_env
 from accelerate.utils import (
     ComputeEnvironment,
     DistributedType,
-    DynamoBackend,
-    PrecisionType,
     PrepareForLaunch,
     _filter_args,
+    check_cuda_p2p_ib_support,
+    convert_dict_to_env_variables,
+    is_bf16_available,
     is_deepspeed_available,
+    is_mlu_available,
+    is_musa_available,
+    is_npu_available,
     is_rich_available,
     is_sagemaker_available,
-    is_torch_version,
+    is_torch_xla_available,
+    is_xpu_available,
     patch_environment,
+    prepare_deepspeed_cmd_env,
+    prepare_multi_gpu_env,
+    prepare_sagemager_args_inputs,
+    prepare_simple_launcher_cmd_env,
     prepare_tpu,
+    str_to_bool,
 )
-from accelerate.utils.constants import DEEPSPEED_MULTINODE_LAUNCHERS
-from accelerate.utils.dataclasses import SageMakerDistributedType
-from accelerate.utils.launch import env_var_path_add
+from accelerate.utils.constants import DEEPSPEED_MULTINODE_LAUNCHERS, TORCH_DYNAMO_MODES
 
 
 if is_rich_available():
@@ -61,81 +67,96 @@ if is_rich_available():
 
 logger = logging.getLogger(__name__)
 
+
 options_to_group = {
-    "--multi-gpu": "Distributed GPUs",
-    "--tpu": "TPU",
-    "--mps": "MPS",
-    "--use_deepspeed": "DeepSpeed Arguments",
-    "--use_fsdp": "FSDP Arguments",
-    "--use_megatron_lm": "Megatron-LM Arguments",
+    "multi_gpu": "Distributed GPUs",
+    "tpu": "TPU",
+    "use_deepspeed": "DeepSpeed Arguments",
+    "use_fsdp": "FSDP Arguments",
+    "use_megatron_lm": "Megatron-LM Arguments",
+    "fp8_backend": "FP8 Arguments",
 }
 
 
 def clean_option(option):
     "Finds all cases of - after the first two characters and changes them to _"
+    if "fp8_backend" in option:
+        option = "--fp8_backend"
     if option.startswith("--"):
-        return option[:3] + option[3:].replace("-", "_")
+        return option[2:].replace("-", "_")
 
 
-class _CustomHelpAction(argparse._HelpAction):
+class CustomHelpFormatter(argparse.HelpFormatter):
     """
-    This is a custom help action that will hide all arguments that are not used in the command line when the help is
+    This is a custom help formatter that will hide all arguments that are not used in the command line when the help is
     called. This is useful for the case where the user is using a specific platform and only wants to see the arguments
     for that platform.
     """
 
-    def __call__(self, parser, namespace, values, option_string=None):
-        if "accelerate" in sys.argv[0] and "launch" in sys.argv[1:]:
-            args = sys.argv[2:]
-        else:
-            args = sys.argv[1:]
-        opts = parser._actions
-        titles = [
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.titles = [
             "Hardware Selection Arguments",
             "Resource Selection Arguments",
             "Training Paradigm Arguments",
             "positional arguments",
             "optional arguments",
         ]
-        if len(args) > 1:
-            used_platforms = [arg for arg in args if arg in options_to_group.keys()]
-            args = list(map(clean_option, args))
-            used_titles = [options_to_group[o] for o in used_platforms]
-            for i, arg in enumerate(opts):
-                # If the argument's container is outside of the used titles, hide it
-                if arg.container.title not in titles + used_titles:
-                    setattr(opts[i], "help", argparse.SUPPRESS)
-                # If the argument is hardware selection, but not being passed, hide it
-                elif arg.container.title == "Hardware Selection Arguments":
-                    if set(arg.option_strings).isdisjoint(set(args)):
-                        setattr(opts[i], "help", argparse.SUPPRESS)
-                    else:
-                        setattr(opts[i], "help", arg.help + " (currently selected)")
-                # If the argument is a training paradigm, but not being passed, hide it
-                elif arg.container.title == "Training Paradigm Arguments":
-                    if set(arg.option_strings).isdisjoint(set(used_platforms)):
-                        setattr(opts[i], "help", argparse.SUPPRESS)
-                    else:
-                        setattr(opts[i], "help", arg.help + " (currently selected)")
-            for i, group in enumerate(list(parser._action_groups)):
-                # If all arguments in the group are hidden, hide the group
-                if all([arg.help == argparse.SUPPRESS for arg in group._group_actions]):
-                    parser._action_groups.remove(group)
 
-        super().__call__(parser, namespace, values, option_string)
+    def add_argument(self, action: argparse.Action):
+        if "accelerate" in sys.argv[0] and "launch" in sys.argv[1:]:
+            args = sys.argv[2:]
+        else:
+            args = sys.argv[1:]
+
+        if len(args) > 1:
+            args = list(map(clean_option, args))
+            used_platforms = [arg for arg in args if arg in options_to_group.keys()]
+            used_titles = [options_to_group[o] for o in used_platforms]
+            if action.container.title not in self.titles + used_titles:
+                action.help = argparse.SUPPRESS
+            elif action.container.title == "Hardware Selection Arguments":
+                if set(action.option_strings).isdisjoint(set(args)):
+                    action.help = argparse.SUPPRESS
+                else:
+                    action.help = action.help + " (currently selected)"
+            elif action.container.title == "Training Paradigm Arguments":
+                if set(action.option_strings).isdisjoint(set(args)):
+                    action.help = argparse.SUPPRESS
+                else:
+                    action.help = action.help + " (currently selected)"
+
+        action.option_strings = [s for s in action.option_strings if "-" not in s[2:]]
+        super().add_argument(action)
+
+    def end_section(self):
+        if len(self._current_section.items) < 2:
+            self._current_section.items = []
+            self._current_section.heading = ""
+        super().end_section()
 
 
 def launch_command_parser(subparsers=None):
+    description = "Launch a python script in a distributed scenario. Arguments can be passed in with either hyphens (`--num-processes=2`) or underscores (`--num_processes=2`)"
     if subparsers is not None:
-        parser = subparsers.add_parser("launch", add_help=False)
+        parser = subparsers.add_parser(
+            "launch", description=description, add_help=False, allow_abbrev=False, formatter_class=CustomHelpFormatter
+        )
     else:
-        parser = argparse.ArgumentParser("Accelerate launch command", add_help=False)
+        parser = CustomArgumentParser(
+            "Accelerate launch command",
+            description=description,
+            add_help=False,
+            allow_abbrev=False,
+            formatter_class=CustomHelpFormatter,
+        )
 
-    parser.register("action", "help", _CustomHelpAction)
     parser.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
 
     parser.add_argument(
-        "--config_file", default=None, help="The config file to use for the default values in the launching script."
+        "--config_file",
+        default=None,
+        help="The config file to use for the default values in the launching script.",
     )
     parser.add_argument(
         "--quiet",
@@ -151,13 +172,6 @@ def launch_command_parser(subparsers=None):
         "--cpu", default=False, action="store_true", help="Whether or not to force the training on the CPU."
     )
     hardware_args.add_argument(
-        "--mps",
-        default=False,
-        action="store_true",
-        help="This argument is deprecated. MPS device will be enabled by default when available and can be disabled via `--cpu`."
-        " Whether or not this should use MPS-enabled GPU device on MacOS machines.",
-    )
-    hardware_args.add_argument(
         "--multi_gpu",
         default=False,
         action="store_true",
@@ -166,22 +180,21 @@ def launch_command_parser(subparsers=None):
     hardware_args.add_argument(
         "--tpu", default=False, action="store_true", help="Whether or not this should launch a TPU training."
     )
+    hardware_args.add_argument(
+        "--ipex",
+        default=False,
+        action="store_true",
+        help="Whether or not this should launch a Intel PyTorch Extension (IPEX) training.",
+    )
 
     # Resource selection arguments
     resource_args = parser.add_argument_group(
         "Resource Selection Arguments", "Arguments for fine-tuning how available hardware should be used."
     )
     resource_args.add_argument(
-        "--dynamo_backend",
-        type=str,
-        choices=["no"] + [b.lower() for b in DYNAMO_BACKENDS],
-        help="Choose a backend to optimize your training with dynamo, see more at "
-        "https://github.com/pytorch/torchdynamo.",
-    )
-    resource_args.add_argument(
         "--mixed_precision",
         type=str,
-        choices=["no", "fp16", "bf16"],
+        choices=["no", "fp16", "bf16", "fp8"],
         help="Whether or not to use mixed precision training. "
         "Choose between FP16 and BF16 (bfloat16) training. "
         "BF16 training is only supported on Nvidia Ampere GPUs and PyTorch 1.10 or later.",
@@ -197,6 +210,39 @@ def launch_command_parser(subparsers=None):
         type=int,
         default=None,
         help="The number of CPU threads per process. Can be tuned for optimal performance.",
+    )
+    resource_args.add_argument(
+        "--enable_cpu_affinity",
+        default=False,
+        action="store_true",
+        help="Whether or not CPU affinity and balancing should be enabled. Currently only supported on NVIDIA hardware.",
+    )
+    # Dynamo arguments
+    resource_args.add_argument(
+        "--dynamo_backend",
+        type=str,
+        choices=["no"] + [b.lower() for b in DYNAMO_BACKENDS],
+        help="Choose a backend to optimize your training with dynamo, see more at "
+        "https://github.com/pytorch/torchdynamo.",
+    )
+    resource_args.add_argument(
+        "--dynamo_mode",
+        type=str,
+        default="default",
+        choices=TORCH_DYNAMO_MODES,
+        help="Choose a mode to optimize your training with dynamo.",
+    )
+    resource_args.add_argument(
+        "--dynamo_use_fullgraph",
+        default=False,
+        action="store_true",
+        help="Whether to use full graph mode for dynamo or it is ok to break model into several subgraphs",
+    )
+    resource_args.add_argument(
+        "--dynamo_use_dynamic",
+        default=False,
+        action="store_true",
+        help="Whether to enable dynamic shape tracing.",
     )
 
     # Training Paradigm arguments
@@ -220,6 +266,12 @@ def launch_command_parser(subparsers=None):
         default=False,
         action="store_true",
         help="Whether to use Megatron-LM.",
+    )
+    paradigm_args.add_argument(
+        "--use_xpu",
+        default=False,
+        action="store_true",
+        help="Whether to use IPEX plugin to speed up training on XPU specifically.",
     )
 
     # distributed GPU training arguments
@@ -247,7 +299,35 @@ def launch_command_parser(subparsers=None):
         default=None,
         help="The port to use to communicate with the machine of rank 0.",
     )
+    distributed_args.add_argument(
+        "-t",
+        "--tee",
+        default="0",
+        type=str,
+        help="Tee std streams into a log file and also to console.",
+    )
+    distributed_args.add_argument(
+        "--log_dir",
+        type=str,
+        default=None,
+        help=(
+            "Base directory to use for log files when using torchrun/torch.distributed.run as launcher. "
+            "Use with --tee to redirect std streams info log files."
+        ),
+    )
+    distributed_args.add_argument(
+        "--role",
+        type=str,
+        default="default",
+        help="User-defined role for the workers.",
+    )
     # Rendezvous related arguments
+    distributed_args.add_argument(
+        "--rdzv_backend",
+        type=str,
+        default="static",
+        help="The rendezvous method to use, such as 'static' (the default) or 'c10d'",
+    )
     distributed_args.add_argument(
         "--rdzv_conf",
         type=str,
@@ -263,7 +343,7 @@ def launch_command_parser(subparsers=None):
     distributed_args.add_argument(
         "--monitor_interval",
         type=float,
-        default=5,
+        default=0.1,
         help="Interval, in seconds, to monitor the state of workers.",
     )
     parser.add_argument(
@@ -283,12 +363,13 @@ def launch_command_parser(subparsers=None):
     tpu_args.add_argument(
         "--tpu_cluster",
         action="store_true",
+        dest="tpu_use_cluster",
         help="Whether to use a GCP TPU pod for training.",
     )
     tpu_args.add_argument(
         "--no_tpu_cluster",
         action="store_false",
-        dest="tpu_cluster",
+        dest="tpu_use_cluster",
         help="Should not be passed explicitly, this is for internal use only.",
     )
     tpu_args.add_argument(
@@ -353,6 +434,20 @@ def launch_command_parser(subparsers=None):
         "If unspecified, will default to 'none'.",
     )
     deepspeed_args.add_argument(
+        "--offload_optimizer_nvme_path",
+        default=None,
+        type=str,
+        help="Decides Nvme Path to offload optimizer states (useful only when `use_deepspeed` flag is passed). "
+        "If unspecified, will default to 'none'.",
+    )
+    deepspeed_args.add_argument(
+        "--offload_param_nvme_path",
+        default=None,
+        type=str,
+        help="Decides Nvme Path to offload parameters (useful only when `use_deepspeed` flag is passed). "
+        "If unspecified, will default to 'none'.",
+    )
+    deepspeed_args.add_argument(
         "--gradient_accumulation_steps",
         default=None,
         type=int,
@@ -404,6 +499,13 @@ def launch_command_parser(subparsers=None):
         type=str,
         help="DeepSpeed multi-node launcher to use. If unspecified, will default to `pdsh`.",
     )
+    deepspeed_args.add_argument(
+        "--deepspeed_moe_layer_cls_names",
+        default=None,
+        type=str,
+        help="comma-separated list of transformer MoE layer class names (case-sensitive) to wrap ,e.g, `MixtralSparseMoeBlock`, `Qwen2MoeSparseMoeBlock`, `JetMoEAttention,JetMoEBlock` ..."
+        " (useful only when `use_deepspeed` flag is passed).",
+    )
 
     # fsdp arguments
     fsdp_args = parser.add_argument_group("FSDP Arguments", "Arguments related to Fully Shared Data Parallelism.")
@@ -421,8 +523,8 @@ def launch_command_parser(subparsers=None):
     )
     fsdp_args.add_argument(
         "--fsdp_sharding_strategy",
-        type=int,
-        default=1,
+        type=str,
+        default="FULL_SHARD",
         help="FSDP's Sharding Strategy. (useful only when `use_fsdp` flag is passed).",
     )
     fsdp_args.add_argument(
@@ -439,7 +541,7 @@ def launch_command_parser(subparsers=None):
         "(useful only when `use_fsdp` flag is passed).",
     )
     fsdp_args.add_argument(
-        "--fsdp_backward_prefetch_policy",
+        "--fsdp_backward_prefetch",
         default=None,
         type=str,
         help="FSDP's backward prefetch policy. (useful only when `use_fsdp` flag is passed).",
@@ -449,6 +551,41 @@ def launch_command_parser(subparsers=None):
         default=None,
         type=str,
         help="FSDP's state dict type. (useful only when `use_fsdp` flag is passed).",
+    )
+    fsdp_args.add_argument(
+        "--fsdp_forward_prefetch",
+        default="false",
+        type=str,
+        help="If True, then FSDP explicitly prefetches the next upcoming "
+        "all-gather while executing in the forward pass (useful only when `use_fsdp` flag is passed).",
+    )
+    fsdp_args.add_argument(
+        "--fsdp_use_orig_params",
+        default="true",
+        type=str,
+        help="If True, allows non-uniform `requires_grad` during init, which means support for interspersed frozen and trainable paramteres."
+        " (useful only when `use_fsdp` flag is passed).",
+    )
+    fsdp_args.add_argument(
+        "--fsdp_cpu_ram_efficient_loading",
+        default="true",
+        type=str,
+        help="If True, only the first process loads the pretrained model checkoint while all other processes have empty weights. "
+        "Only applicable for 🤗 Transformers. When using this, `--fsdp_sync_module_states` needs to True. "
+        "(useful only when `use_fsdp` flag is passed).",
+    )
+    fsdp_args.add_argument(
+        "--fsdp_sync_module_states",
+        default="true",
+        type=str,
+        help="If True, each individually wrapped FSDP unit will broadcast module parameters from rank 0."
+        " (useful only when `use_fsdp` flag is passed).",
+    )
+    fsdp_args.add_argument(
+        "--fsdp_activation_checkpointing",
+        default="false",
+        type=str,
+        help="Decides Whether (true|false) intermediate activations are freed during the forward pass, and a checkpoint is left as a placeholder. (useful only when `use_fsdp` flag is passed).",
     )
 
     # megatron_lm args
@@ -501,6 +638,68 @@ def launch_command_parser(subparsers=None):
         "(useful only when `use_megatron_lm` flag is passed).",
     )
 
+    # FP8 arguments
+    fp8_args = parser.add_argument_group(
+        "FP8 Arguments", "Arguments related to FP8 training (requires `--mixed_precision=fp8`)"
+    )
+    fp8_args.add_argument(
+        "--fp8_backend",
+        type=str,
+        choices=["te", "msamp"],
+        help="Choose a backend to train with FP8 (te: TransformerEngine, msamp: MS-AMP)",
+    )
+    fp8_args.add_argument(
+        "--fp8_use_autocast_during_eval",
+        default=False,
+        action="store_true",
+        help="Whether to use FP8 autocast during eval mode (useful only when `--fp8_backend=te` is passed). Generally better metrics are found when this is not passed.",
+    )
+    fp8_args.add_argument(
+        "--fp8_margin",
+        type=int,
+        default=0,
+        help="The margin to use for the gradient scaling (useful only when `--fp8_backend=te` is passed).",
+    )
+    fp8_args.add_argument(
+        "--fp8_interval",
+        type=int,
+        default=1,
+        help="The interval to use for how often the scaling factor is recomputed (useful only when `--fp8_backend=te` is passed).",
+    )
+    fp8_args.add_argument(
+        "--fp8_format",
+        type=str,
+        default="E4M3",
+        choices=["E4M3", "HYBRID"],
+        help="The format to use for the FP8 recipe (useful only when `--fp8_backend=te` is passed).",
+    )
+    fp8_args.add_argument(
+        "--fp8_amax_history_len",
+        type=int,
+        default=1024,
+        help="The length of the history to use for the scaling factor computation (useful only when `--fp8_backend=te` is passed).",
+    )
+    fp8_args.add_argument(
+        "--fp8_amax_compute_algo",
+        type=str,
+        default="most_recent",
+        choices=["max", "most_recent"],
+        help="The algorithm to use for the scaling factor computation. (useful only when `--fp8_backend=te` is passed).",
+    )
+    fp8_args.add_argument(
+        "--fp8_override_linear_precision",
+        type=lambda x: tuple(map(str_to_bool, x.split(","))),
+        default=(False, False, False),
+        help="Whether or not to execute `fprop`, `dgrad`, and `wgrad` GEMMS in higher precision. Should be passed in a comma-seperated string of booleans (useful only when `--fp8_backend=te` is passed).",
+    )
+    fp8_args.add_argument(
+        "--fp8_opt_level",
+        type=str,
+        default="O2",
+        choices=["O1", "O2"],
+        help="What level of 8-bit collective communication should be used with MS-AMP (useful only when `--fp8_backend=msamp` is passed).",
+    )
+
     # AWS arguments
     aws_args = parser.add_argument_group("AWS Arguments", "Arguments related to AWS.")
     aws_args.add_argument(
@@ -529,6 +728,22 @@ def launch_command_parser(subparsers=None):
         ),
     )
 
+    # MPI arguments
+    mpirun_args = parser.add_argument_group("MPI Arguments", "Arguments related to mpirun for Multi-CPU")
+    mpirun_args.add_argument(
+        "--mpirun_hostfile",
+        type=str,
+        default=None,
+        help="Location for a hostfile for using Accelerate to launch a multi-CPU training job with mpirun. This will "
+        "get passed to the MPI --hostfile or -f parameter, depending on which MPI program is installed.",
+    )
+    mpirun_args.add_argument(
+        "--mpirun_ccl",
+        type=int,
+        default=1,
+        help="The number of oneCCL worker threads when using Accelerate to launch multi-CPU training with mpirun.",
+    )
+
     # Other arguments of the training scripts
     parser.add_argument("training_script_args", nargs=argparse.REMAINDER, help="Arguments of the training script.")
 
@@ -538,50 +753,7 @@ def launch_command_parser(subparsers=None):
 
 
 def simple_launcher(args):
-    cmd = []
-    if args.no_python and args.module:
-        raise ValueError("--module and --no_python cannot be used together")
-    if not args.no_python:
-        cmd.append(sys.executable)
-        if args.module:
-            cmd.append("-m")
-    cmd.append(args.training_script)
-    cmd.extend(args.training_script_args)
-
-    current_env = os.environ.copy()
-    current_env["ACCELERATE_USE_CPU"] = str(args.cpu or args.use_cpu)
-    current_env["ACCELERATE_USE_MPS_DEVICE"] = str(args.mps)
-    if args.mps:
-        warnings.warn(
-            "`mps` is deprecated and will be removed in version 0.18.0 of 🤗 Accelerate."
-            " MPS device will be enabled by default when available and can be disabled via `--cpu`.",
-            FutureWarning,
-        )
-    elif args.gpu_ids != "all" and args.gpu_ids is not None:
-        current_env["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
-    if args.num_machines > 1:
-        current_env["MASTER_ADDR"] = args.main_process_ip
-        current_env["MASTER_PORT"] = str(args.main_process_port)
-    elif args.num_processes > 1:
-        current_env["MASTER_ADDR"] = args.main_process_ip if args.main_process_ip is not None else "127.0.0.1"
-        current_env["MASTER_PORT"] = str(args.main_process_port) if args.main_process_port is not None else "29500"
-
-    try:
-        mixed_precision = PrecisionType(args.mixed_precision.lower())
-    except ValueError:
-        raise ValueError(
-            f"Unknown mixed_precision mode: {args.mixed_precision.lower()}. Choose between {PrecisionType.list()}."
-        )
-
-    current_env["ACCELERATE_MIXED_PRECISION"] = str(mixed_precision)
-
-    try:
-        dynamo_backend = DynamoBackend(args.dynamo_backend.upper())
-    except ValueError:
-        raise ValueError(f"Unknown dynamo backend: {args.dynamo_backend.upper()}. Choose between {DYNAMO_BACKENDS}.")
-    current_env["ACCELERATE_DYNAMO_BACKEND"] = dynamo_backend.value
-
-    current_env["OMP_NUM_THREADS"] = str(args.num_cpu_threads_per_process)
+    cmd, current_env = prepare_simple_launcher_cmd_env(args)
 
     process = subprocess.Popen(cmd, env=current_env)
     process.wait()
@@ -593,83 +765,20 @@ def simple_launcher(args):
 
 
 def multi_gpu_launcher(args):
-    if is_torch_version(">=", "1.9.1"):
-        import torch.distributed.run as distrib_run
-    else:
-        raise NotImplementedError("Native multi-GPU training requires pytorch>=1.9.1")
-    num_processes = getattr(args, "num_processes")
-    num_machines = getattr(args, "num_machines")
-    main_process_ip = getattr(args, "main_process_ip")
-    main_process_port = getattr(args, "main_process_port")
-    if num_machines > 1:
-        setattr(args, "nproc_per_node", str(num_processes // num_machines))
-        setattr(args, "nnodes", str(num_machines))
-        setattr(args, "node_rank", int(args.machine_rank))
-        if getattr(args, "same_network", False):
-            setattr(args, "master_addr", str(main_process_ip))
-            setattr(args, "master_port", str(main_process_port))
-        else:
-            setattr(args, "rdzv_endpoint", f"{main_process_ip}:{main_process_port}")
-    else:
-        setattr(args, "nproc_per_node", str(num_processes))
-        if main_process_port is not None:
-            setattr(args, "master_port", str(main_process_port))
+    import torch.distributed.run as distrib_run
 
-    if args.module and args.no_python:
-        raise ValueError("--module and --no_python cannot be used together")
-    elif args.module:
-        setattr(args, "module", True)
-    elif args.no_python:
-        setattr(args, "no_python", True)
-
-    current_env = os.environ.copy()
-    gpu_ids = getattr(args, "gpu_ids", "all")
-    if gpu_ids != "all" and args.gpu_ids is not None:
-        current_env["CUDA_VISIBLE_DEVICES"] = gpu_ids
-    mixed_precision = args.mixed_precision.lower()
-    try:
-        mixed_precision = PrecisionType(mixed_precision)
-    except ValueError:
-        raise ValueError(f"Unknown mixed_precision mode: {mixed_precision}. Choose between {PrecisionType.list()}.")
-
-    current_env["ACCELERATE_MIXED_PRECISION"] = str(mixed_precision)
-
-    try:
-        dynamo_backend = DynamoBackend(args.dynamo_backend.upper())
-    except ValueError:
-        raise ValueError(f"Unknown dynamo backend: {args.dynamo_backend.upper()}. Choose between {DYNAMO_BACKENDS}.")
-    current_env["ACCELERATE_DYNAMO_BACKEND"] = dynamo_backend.value
-
-    if args.use_fsdp:
-        current_env["ACCELERATE_USE_FSDP"] = "true"
-        current_env["FSDP_SHARDING_STRATEGY"] = str(args.fsdp_sharding_strategy)
-        current_env["FSDP_OFFLOAD_PARAMS"] = str(args.fsdp_offload_params).lower()
-        current_env["FSDP_MIN_NUM_PARAMS"] = str(args.fsdp_min_num_params)
-        if args.fsdp_auto_wrap_policy is not None:
-            current_env["FSDP_AUTO_WRAP_POLICY"] = str(args.fsdp_auto_wrap_policy)
-        if args.fsdp_transformer_layer_cls_to_wrap is not None:
-            current_env["FSDP_TRANSFORMER_CLS_TO_WRAP"] = str(args.fsdp_transformer_layer_cls_to_wrap)
-        if args.fsdp_backward_prefetch_policy is not None:
-            current_env["FSDP_BACKWARD_PREFETCH"] = str(args.fsdp_backward_prefetch_policy)
-        if args.fsdp_state_dict_type is not None:
-            current_env["FSDP_STATE_DICT_TYPE"] = str(args.fsdp_state_dict_type)
-
-    if args.use_megatron_lm:
-        prefix = "MEGATRON_LM_"
-        current_env["ACCELERATE_USE_MEGATRON_LM"] = "true"
-        current_env[prefix + "TP_DEGREE"] = str(args.megatron_lm_tp_degree)
-        current_env[prefix + "PP_DEGREE"] = str(args.megatron_lm_pp_degree)
-        current_env[prefix + "GRADIENT_CLIPPING"] = str(args.megatron_lm_gradient_clipping)
-        if args.megatron_lm_num_micro_batches is not None:
-            current_env[prefix + "NUM_MICRO_BATCHES"] = str(args.megatron_lm_num_micro_batches)
-        if args.megatron_lm_sequence_parallelism is not None:
-            current_env[prefix + "SEQUENCE_PARALLELISM"] = str(args.megatron_lm_sequence_parallelism)
-        if args.megatron_lm_recompute_activations is not None:
-            current_env[prefix + "RECOMPUTE_ACTIVATIONS"] = str(args.megatron_lm_recompute_activations)
-        if args.megatron_lm_use_distributed_optimizer is not None:
-            current_env[prefix + "USE_DISTRIBUTED_OPTIMIZER"] = str(args.megatron_lm_use_distributed_optimizer)
-
-    current_env["OMP_NUM_THREADS"] = str(args.num_cpu_threads_per_process)
+    current_env = prepare_multi_gpu_env(args)
+    if not check_cuda_p2p_ib_support():
+        message = "Using RTX 4000 series which doesn't support faster communication speedups. Ensuring P2P and IB communications are disabled."
+        warn = False
+        if "NCCL_P2P_DISABLE" not in current_env:
+            current_env["NCCL_P2P_DISABLE"] = "1"
+            warn = True
+        if "NCCL_IB_DISABLE" not in current_env:
+            current_env["NCCL_IB_DISABLE"] = "1"
+            warn = True
+        if warn:
+            logger.warning(message)
 
     debug = getattr(args, "debug", False)
     args = _filter_args(
@@ -677,6 +786,7 @@ def multi_gpu_launcher(args):
         distrib_run.get_args_parser(),
         ["--training_script", args.training_script, "--training_script_args", args.training_script_args],
     )
+
     with patch_environment(**current_env):
         try:
             distrib_run.run(args)
@@ -685,110 +795,36 @@ def multi_gpu_launcher(args):
                 console = get_console()
                 console.print("\n[bold red]Using --debug, `torch.distributed` Stack Trace:[/bold red]")
                 console.print_exception(suppress=[__file__], show_locals=False)
+            else:
+                raise
 
 
 def deepspeed_launcher(args):
-    if is_torch_version(">=", "1.9.1"):
-        import torch.distributed.run as distrib_run
+    import torch.distributed.run as distrib_run
+
     if not is_deepspeed_available():
         raise ImportError("DeepSpeed is not installed => run `pip3 install deepspeed` or build it from source.")
-    num_processes = getattr(args, "num_processes")
-    num_machines = getattr(args, "num_machines")
-    main_process_ip = getattr(args, "main_process_ip")
-    main_process_port = getattr(args, "main_process_port")
-
-    # make sure launcher is not None
-    if args.deepspeed_multinode_launcher is None:
-        # set to default pdsh
-        setattr(args, "deepspeed_multinode_launcher", DEEPSPEED_MULTINODE_LAUNCHERS[0])
-
-    if num_machines > 1 and args.deepspeed_multinode_launcher != DEEPSPEED_MULTINODE_LAUNCHERS[1]:
-        cmd = ["deepspeed", "--no_local_rank"]
-        cmd.extend(["--hostfile", str(args.deepspeed_hostfile), "--launcher", str(args.deepspeed_multinode_launcher)])
-        if args.deepspeed_exclusion_filter is not None:
-            cmd.extend(
-                [
-                    "--exclude",
-                    str(args.deepspeed_exclusion_filter),
-                ]
-            )
-        elif args.deepspeed_inclusion_filter is not None:
-            cmd.extend(
-                [
-                    "--include",
-                    str(args.deepspeed_inclusion_filter),
-                ]
-            )
-        else:
-            cmd.extend(["--num_gpus", str(args.num_processes // args.num_machines)])
-        cmd.extend(["--master_port", str(main_process_port)])
-        if args.module and args.no_python:
-            raise ValueError("--module and --no_python cannot be used together")
-        elif args.module:
-            cmd.append("--module")
-        elif args.no_python:
-            cmd.append("--no_python")
-        cmd.append(args.training_script)
-        cmd.extend(args.training_script_args)
-    elif num_machines > 1 and args.deepspeed_multinode_launcher == DEEPSPEED_MULTINODE_LAUNCHERS[1]:
-        setattr(args, "nproc_per_node", str(num_processes // num_machines))
-        setattr(args, "nnodes", str(num_machines))
-        setattr(args, "node_rank", int(args.machine_rank))
-        if getattr(args, "same_network", False):
-            setattr(args, "master_addr", str(main_process_ip))
-            setattr(args, "master_port", str(main_process_port))
-        else:
-            setattr(args, "rdzv_endpoint", f"{main_process_ip}:{main_process_port}")
     else:
-        setattr(args, "nproc_per_node", str(num_processes))
-        if main_process_port is not None:
-            setattr(args, "master_port", str(main_process_port))
+        from deepspeed.launcher.runner import DEEPSPEED_ENVIRONMENT_NAME
 
-    if args.module and args.no_python:
-        raise ValueError("--module and --no_python cannot be used together")
-    elif args.module:
-        setattr(args, "module", True)
-    elif args.no_python:
-        setattr(args, "no_python", True)
-
-    current_env = os.environ.copy()
-    gpu_ids = getattr(args, "gpu_ids", "all")
-    if gpu_ids != "all" and args.gpu_ids is not None:
-        current_env["CUDA_VISIBLE_DEVICES"] = gpu_ids
-    try:
-        mixed_precision = PrecisionType(args.mixed_precision.lower())
-    except ValueError:
-        raise ValueError(
-            f"Unknown mixed_precision mode: {args.mixed_precision.lower()}. Choose between {PrecisionType.list()}."
-        )
-
-    current_env["PYTHONPATH"] = env_var_path_add("PYTHONPATH", os.path.abspath("."))
-    current_env["ACCELERATE_MIXED_PRECISION"] = str(mixed_precision)
-    current_env["ACCELERATE_CONFIG_DS_FIELDS"] = str(args.deepspeed_fields_from_accelerate_config).lower()
-    current_env["ACCELERATE_USE_DEEPSPEED"] = "true"
-    if args.zero_stage is not None:
-        current_env["ACCELERATE_DEEPSPEED_ZERO_STAGE"] = str(args.zero_stage)
-    if args.gradient_accumulation_steps is not None:
-        current_env["ACCELERATE_GRADIENT_ACCUMULATION_STEPS"] = str(args.gradient_accumulation_steps)
-    if args.gradient_clipping is not None:
-        current_env["ACCELERATE_GRADIENT_CLIPPING"] = str(args.gradient_clipping).lower()
-    if args.offload_optimizer_device is not None:
-        current_env["ACCELERATE_DEEPSPEED_OFFLOAD_OPTIMIZER_DEVICE"] = str(args.offload_optimizer_device).lower()
-    if args.offload_param_device is not None:
-        current_env["ACCELERATE_DEEPSPEED_OFFLOAD_PARAM_DEVICE"] = str(args.offload_param_device).lower()
-    if args.zero3_init_flag is not None:
-        current_env["ACCELERATE_DEEPSPEED_ZERO3_INIT"] = str(args.zero3_init_flag).lower()
-    if args.zero3_save_16bit_model is not None:
-        current_env["ACCELERATE_DEEPSPEED_ZERO3_SAVE_16BIT_MODEL"] = str(args.zero3_save_16bit_model).lower()
-    if args.deepspeed_config_file is not None:
-        current_env["ACCELERATE_DEEPSPEED_CONFIG_FILE"] = str(args.deepspeed_config_file)
+    cmd, current_env = prepare_deepspeed_cmd_env(args)
+    if not check_cuda_p2p_ib_support():
+        message = "Using RTX 4000 series which doesn't support faster communication speedups. Ensuring P2P and IB communications are disabled."
+        warn = False
+        if "NCCL_P2P_DISABLE" not in current_env:
+            current_env["NCCL_P2P_DISABLE"] = "1"
+            warn = True
+        if "NCCL_IB_DISABLE" not in current_env:
+            current_env["NCCL_IB_DISABLE"] = "1"
+            warn = True
+        if warn:
+            logger.warning(message)
 
     if args.num_machines > 1 and args.deepspeed_multinode_launcher != DEEPSPEED_MULTINODE_LAUNCHERS[1]:
-        with open(".deepspeed_env", "a") as f:
-            for key, value in current_env.items():
-                if ";" in value or " " in value:
-                    continue
-                f.write(f"{key}={value}\n")
+        with open(DEEPSPEED_ENVIRONMENT_NAME, "a") as f:
+            valid_env_items = convert_dict_to_env_variables(current_env)
+            if len(valid_env_items) > 1:
+                f.writelines(valid_env_items)
 
         process = subprocess.Popen(cmd, env=current_env)
         process.wait()
@@ -798,9 +834,6 @@ def deepspeed_launcher(args):
             else:
                 sys.exit(1)
     else:
-        if is_torch_version("<", "1.9.1"):
-            raise NotImplementedError("Multi-node training requires pytorch>=1.9.1")
-
         debug = getattr(args, "debug", False)
         args = _filter_args(
             args,
@@ -815,10 +848,13 @@ def deepspeed_launcher(args):
                     console = get_console()
                     console.print("\n[bold red]Using --debug, `torch.distributed` Stack Trace:[/bold red]")
                     console.print_exception(suppress=[__file__], show_locals=False)
+                else:
+                    raise
 
 
 def tpu_launcher(args):
     import torch_xla.distributed.xla_multiprocessing as xmp
+    from torch_xla import device_count
 
     if args.no_python:
         raise ValueError("--no_python cannot be used with TPU launcher")
@@ -839,13 +875,17 @@ def tpu_launcher(args):
             f"Your training script should have a function named {args.main_training_function}, or you should pass a "
             "different value to `--main_training_function`."
         )
+    if args.num_processes and args.num_processes != device_count():
+        raise ValueError(
+            f"Number of processes ({args.num_processes}) must match the number of TPU devices ({device_count()})"
+        )
 
     # Patch sys.argv
     sys.argv = [mod.__file__] + args.training_script_args
 
     main_function = getattr(mod, args.main_training_function)
     with patch_environment(**current_env):
-        xmp.spawn(PrepareForLaunch(main_function), args=(), nprocs=args.num_processes)
+        xmp.spawn(PrepareForLaunch(main_function), args=())
 
 
 def tpu_pod_launcher(args):
@@ -871,10 +911,10 @@ def tpu_pod_launcher(args):
         "--tpu",
         "--no_tpu_cluster",
         "--num_machines",
-        str(1),
+        "1",
         "--mixed_precision",
         "no",
-        "--dynmo_backend",
+        "--dynamo_backend",
         "no",
         "--num_processes",
         str(args.num_processes),
@@ -907,48 +947,6 @@ def tpu_pod_launcher(args):
             raise
 
 
-def _convert_nargs_to_dict(nargs: List[str]) -> Dict[str, str]:
-    if len(nargs) < 0:
-        return {}
-    # helper function to infer type for argsparser
-
-    def _infer_type(s):
-        try:
-            s = float(s)
-
-            if s // 1 == s:
-                return int(s)
-            return s
-        except ValueError:
-            return s
-
-    parser = argparse.ArgumentParser()
-    _, unknown = parser.parse_known_args(nargs)
-    for index, argument in enumerate(unknown):
-        if argument.startswith(("-", "--")):
-            action = None
-            if index + 1 < len(unknown):  # checks if next index would be in list
-                if unknown[index + 1].startswith(("-", "--")):  # checks if next element is an key
-                    # raise an error if element is store_true or store_false
-                    raise ValueError(
-                        "SageMaker doesn’t support argparse actions for `store_true` or `store_false`. Please define explicit types"
-                    )
-            else:  # raise an error if last element is store_true or store_false
-                raise ValueError(
-                    "SageMaker doesn’t support argparse actions for `store_true` or `store_false`. Please define explicit types"
-                )
-            # adds argument to parser based on action_store true
-            if action is None:
-                parser.add_argument(argument, type=_infer_type)
-            else:
-                parser.add_argument(argument, action=action)
-
-    return {
-        key: (literal_eval(value) if value in ("True", "False") else value)
-        for key, value in parser.parse_args(nargs).__dict__.items()
-    }
-
-
 def sagemaker_launcher(sagemaker_config: SageMakerConfig, args):
     if not is_sagemaker_available():
         raise ImportError(
@@ -961,108 +959,7 @@ def sagemaker_launcher(sagemaker_config: SageMakerConfig, args):
 
     from sagemaker.huggingface import HuggingFace
 
-    # configure environment
-    print("Configuring Amazon SageMaker environment")
-    os.environ["AWS_DEFAULT_REGION"] = sagemaker_config.region
-
-    # configure credentials
-    if sagemaker_config.profile is not None:
-        os.environ["AWS_PROFILE"] = sagemaker_config.profile
-    elif args.aws_access_key_id is not None and args.aws_secret_access_key is not None:
-        os.environ["AWS_ACCESS_KEY_ID"] = args.aws_access_key_id
-        os.environ["AWS_SECRET_ACCESS_KEY"] = args.aws_secret_access_key
-    else:
-        raise EnvironmentError(
-            "You need to provide an aws_access_key_id and aws_secret_access_key when not using aws_profile"
-        )
-
-    # extract needed arguments
-    source_dir = os.path.dirname(args.training_script)
-    if not source_dir:  # checks if string is empty
-        source_dir = "."
-    entry_point = os.path.basename(args.training_script)
-    if not entry_point.endswith(".py"):
-        raise ValueError(f'Your training script should be a python script and not "{entry_point}"')
-
-    print("Converting Arguments to Hyperparameters")
-    hyperparameters = _convert_nargs_to_dict(args.training_script_args)
-
-    try:
-        mixed_precision = PrecisionType(args.mixed_precision.lower())
-    except ValueError:
-        raise ValueError(
-            f"Unknown mixed_precision mode: {args.mixed_precision.lower()}. Choose between {PrecisionType.list()}."
-        )
-
-    try:
-        dynamo_backend = DynamoBackend(args.dynamo_backend.upper())
-    except ValueError:
-        raise ValueError(f"Unknown dynamo backend: {args.dynamo_backend.upper()}. Choose between {DYNAMO_BACKENDS}.")
-
-    # Environment variables to be set for use during training job
-    environment = {
-        "ACCELERATE_USE_SAGEMAKER": "true",
-        "ACCELERATE_MIXED_PRECISION": str(mixed_precision),
-        "ACCELERATE_DYNAMO_BACKEND": dynamo_backend.value,
-        "ACCELERATE_SAGEMAKER_DISTRIBUTED_TYPE": sagemaker_config.distributed_type.value,
-    }
-    # configure distribution set up
-    distribution = None
-    if sagemaker_config.distributed_type == SageMakerDistributedType.DATA_PARALLEL:
-        distribution = {"smdistributed": {"dataparallel": {"enabled": True}}}
-
-    # configure sagemaker inputs
-    sagemaker_inputs = None
-    if sagemaker_config.sagemaker_inputs_file is not None:
-        print(f"Loading SageMaker Inputs from {sagemaker_config.sagemaker_inputs_file} file")
-        sagemaker_inputs = {}
-        with open(sagemaker_config.sagemaker_inputs_file) as file:
-            for i, line in enumerate(file):
-                if i == 0:
-                    continue
-                l = line.split("\t")
-                sagemaker_inputs[l[0]] = l[1].strip()
-        print(f"Loaded SageMaker Inputs: {sagemaker_inputs}")
-
-    # configure sagemaker metrics
-    sagemaker_metrics = None
-    if sagemaker_config.sagemaker_metrics_file is not None:
-        print(f"Loading SageMaker Metrics from {sagemaker_config.sagemaker_metrics_file} file")
-        sagemaker_metrics = []
-        with open(sagemaker_config.sagemaker_metrics_file) as file:
-            for i, line in enumerate(file):
-                if i == 0:
-                    continue
-                l = line.split("\t")
-                metric_dict = {
-                    "Name": l[0],
-                    "Regex": l[1].strip(),
-                }
-                sagemaker_metrics.append(metric_dict)
-        print(f"Loaded SageMaker Metrics: {sagemaker_metrics}")
-
-    # configure session
-    print("Creating Estimator")
-    args = {
-        "image_uri": sagemaker_config.image_uri,
-        "entry_point": entry_point,
-        "source_dir": source_dir,
-        "role": sagemaker_config.iam_role_name,
-        "transformers_version": sagemaker_config.transformers_version,
-        "pytorch_version": sagemaker_config.pytorch_version,
-        "py_version": sagemaker_config.py_version,
-        "base_job_name": sagemaker_config.base_job_name,
-        "instance_count": sagemaker_config.num_machines,
-        "instance_type": sagemaker_config.ec2_instance_type,
-        "debugger_hook_config": False,
-        "distribution": distribution,
-        "hyperparameters": hyperparameters,
-        "environment": environment,
-        "metric_definitions": sagemaker_metrics,
-    }
-
-    if sagemaker_config.additional_args is not None:
-        args = {**args, **sagemaker_config.additional_args}
+    args, sagemaker_inputs = prepare_sagemager_args_inputs(sagemaker_config, args)
 
     huggingface_estimator = HuggingFace(**args)
 
@@ -1070,11 +967,11 @@ def sagemaker_launcher(sagemaker_config: SageMakerConfig, args):
     print(f"You can find your model data at: {huggingface_estimator.model_data}")
 
 
-def launch_command(args):
+def _validate_launch_command(args):
     # Sanity checks
-    if sum([args.multi_gpu, args.cpu, args.tpu, args.mps, args.use_deepspeed, args.use_fsdp]) > 1:
+    if sum([args.multi_gpu, args.cpu, args.tpu, args.use_deepspeed, args.use_fsdp]) > 1:
         raise ValueError(
-            "You can only use one of `--cpu`, `--multi_gpu`, `--mps`, `--tpu`, `--use_deepspeed`, `--use_fsdp` at a time."
+            "You can only use one of `--cpu`, `--multi_gpu`, `--tpu`, `--use_deepspeed`, `--use_fsdp` at a time."
         )
     if args.multi_gpu and (args.num_processes is not None) and (args.num_processes < 2):
         raise ValueError("You need to use at least 2 processes to use `--multi_gpu`.")
@@ -1088,27 +985,42 @@ def launch_command(args):
         if (
             not args.multi_gpu
             and not args.tpu
-            and not args.tpu_cluster
-            and not args.mps
+            and not args.tpu_use_cluster
             and not args.use_deepspeed
             and not args.use_fsdp
             and not args.use_megatron_lm
         ):
             args.use_deepspeed = defaults.distributed_type == DistributedType.DEEPSPEED
-            args.multi_gpu = defaults.distributed_type == DistributedType.MULTI_GPU
-            args.tpu = defaults.distributed_type == DistributedType.TPU
+            args.multi_gpu = (
+                True
+                if defaults.distributed_type
+                in (
+                    DistributedType.MULTI_GPU,
+                    DistributedType.MULTI_NPU,
+                    DistributedType.MULTI_MLU,
+                    DistributedType.MULTI_MUSA,
+                    DistributedType.MULTI_XPU,
+                )
+                else False
+            )
+            args.tpu = defaults.distributed_type == DistributedType.XLA
             args.use_fsdp = defaults.distributed_type == DistributedType.FSDP
-            args.mps = defaults.distributed_type == DistributedType.MPS
             args.use_megatron_lm = defaults.distributed_type == DistributedType.MEGATRON_LM
-            args.tpu_cluster = defaults.tpu_cluster if args.tpu else False
-        if not args.mps:
-            if args.gpu_ids is None:
-                if defaults.gpu_ids is not None:
-                    args.gpu_ids = defaults.gpu_ids
-                else:
-                    args.gpu_ids = "all"
-            if len(args.gpu_ids.split(",")) < 2 and args.multi_gpu and (args.gpu_ids != "all"):
-                args.multi_gpu = False
+            args.tpu_use_cluster = defaults.tpu_use_cluster if args.tpu else False
+        if args.gpu_ids is None:
+            if defaults.gpu_ids is not None:
+                args.gpu_ids = defaults.gpu_ids
+            else:
+                args.gpu_ids = "all"
+
+        if args.multi_gpu and args.num_machines is None:
+            args.num_machines = defaults.num_machines
+
+        if len(args.gpu_ids.split(",")) < 2 and (args.gpu_ids != "all") and args.multi_gpu and args.num_machines <= 1:
+            raise ValueError(
+                "Less than two GPU ids were configured and tried to run on on multiple GPUs. "
+                "Please ensure at least two are specified for `--gpu_ids`, or use `--gpu_ids='all'`."
+            )
         if defaults.compute_environment == ComputeEnvironment.LOCAL_MACHINE:
             # Update args with the defaults
             for name, attr in defaults.__dict__.items():
@@ -1122,6 +1034,12 @@ def launch_command(args):
                         setattr(args, arg_to_set, defaults.fsdp_config[k])
                     for k in defaults.megatron_lm_config:
                         setattr(args, k, defaults.megatron_lm_config[k])
+                    for k in defaults.dynamo_config:
+                        setattr(args, k, defaults.dynamo_config[k])
+                    for k in defaults.ipex_config:
+                        setattr(args, k, defaults.ipex_config[k])
+                    for k in defaults.mpirun_config:
+                        setattr(args, k, defaults.mpirun_config[k])
                     continue
 
                 # Those args are handled separately
@@ -1130,20 +1048,63 @@ def launch_command(args):
                     and getattr(args, name, None) is None
                 ):
                     setattr(args, name, attr)
+        if not args.debug:
+            args.debug = defaults.debug
+
         if not args.mixed_precision:
             if defaults.mixed_precision is None:
                 args.mixed_precision = "no"
             else:
                 args.mixed_precision = defaults.mixed_precision
                 mp_from_config_flag = True
+        else:
+            if args.use_cpu or (args.use_xpu and torch.xpu.is_available()):
+                native_amp = True
+            else:
+                native_amp = is_bf16_available(True)
+            if (
+                args.mixed_precision == "bf16"
+                and not native_amp
+                and not (args.tpu and is_torch_xla_available(check_is_tpu=True))
+            ):
+                raise ValueError("bf16 mixed precision requires PyTorch >= 1.10 and a supported device.")
 
+        # Silently set the default here
         if args.dynamo_backend is None:
-            warned.append("\t`--dynamo_backend` was set to a value of `'no'`")
             args.dynamo_backend = "no"
+        if args.num_processes == -1:
+            raise ValueError("You need to manually pass in `--num_processes` using this config yaml.")
     else:
         if args.num_processes is None:
-            args.num_processes = torch.cuda.device_count() if args.multi_gpu else 1
+            if args.use_xpu and is_xpu_available():
+                args.num_processes = torch.xpu.device_count()
+            elif is_mlu_available():
+                args.num_processes = torch.mlu.device_count()
+            elif is_musa_available():
+                args.num_processes = torch.musa.device_count()
+            elif is_npu_available():
+                args.num_processes = torch.npu.device_count()
+            else:
+                args.num_processes = torch.cuda.device_count()
             warned.append(f"\t`--num_processes` was set to a value of `{args.num_processes}`")
+        if args.debug is None:
+            args.debug = False
+        if (
+            not args.multi_gpu
+            and args.num_processes > 1
+            and (
+                (args.use_xpu and is_xpu_available() and torch.xpu.device_count() > 1)
+                or (is_mlu_available() and torch.mlu.device_count() > 1)
+                or (is_musa_available() and torch.musa.device_count() > 1)
+                or (is_npu_available() and torch.npu.device_count() > 1)
+                or (torch.cuda.device_count() > 1)
+            )
+        ):
+            warned.append(
+                "\t\tMore than one GPU was found, enabling multi-GPU training.\n"
+                "\t\tIf this was unintended please pass in `--num_processes=1`."
+            )
+            args.multi_gpu = True
         if args.num_machines is None:
             warned.append("\t`--num_machines` was set to a value of `1`")
             args.num_machines = 1
@@ -1155,15 +1116,18 @@ def launch_command(args):
         if args.dynamo_backend is None:
             warned.append("\t`--dynamo_backend` was set to a value of `'no'`")
             args.dynamo_backend = "no"
+    if args.debug:
+        logger.debug("Running script in debug mode, expect distributed operations to be slightly slower.")
 
     is_aws_env_disabled = defaults is None or (
         defaults is not None and defaults.compute_environment != ComputeEnvironment.AMAZON_SAGEMAKER
     )
     if is_aws_env_disabled and args.num_cpu_threads_per_process is None:
-        args.num_cpu_threads_per_process = 1
-        if args.use_cpu and args.num_processes > 1:
+        args.num_cpu_threads_per_process = get_int_from_env(["OMP_NUM_THREADS"], 1)
+        if args.use_cpu and args.num_processes >= 1 and get_int_from_env(["OMP_NUM_THREADS"], 0) == 0:
             local_size = get_int_from_env(
-                ["MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE", "MV2_COMM_WORLD_LOCAL_SIZE"], 1
+                ["MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE", "MV2_COMM_WORLD_LOCAL_SIZE"],
+                max(int(args.num_processes / args.num_machines), 1),
             )
             threads_per_process = int(psutil.cpu_count(logical=False) / local_size)
             if threads_per_process > 1:
@@ -1179,7 +1143,11 @@ def launch_command(args):
             "\nTo avoid this warning pass in values for each of the problematic parameters or run `accelerate config`."
         )
         logger.warning(message)
+    return args, defaults, mp_from_config_flag
 
+
+def launch_command(args):
+    args, defaults, mp_from_config_flag = _validate_launch_command(args)
     # Use the proper launcher
     if args.use_deepspeed and not args.cpu:
         args.deepspeed_fields_from_accelerate_config = list(defaults.deepspeed_config.keys()) if defaults else []
@@ -1194,7 +1162,7 @@ def launch_command(args):
     elif args.multi_gpu and not args.cpu:
         multi_gpu_launcher(args)
     elif args.tpu and not args.cpu:
-        if args.tpu_cluster:
+        if args.tpu_use_cluster:
             tpu_pod_launcher(args)
         else:
             tpu_launcher(args)

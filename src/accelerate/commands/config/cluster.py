@@ -19,10 +19,16 @@ import os
 from ...utils import (
     ComputeEnvironment,
     DistributedType,
-    DynamoBackend,
     is_deepspeed_available,
+    is_fp8_available,
+    is_mlu_available,
     is_mps_available,
+    is_msamp_available,
+    is_musa_available,
+    is_npu_available,
+    is_transformer_engine_available,
     is_transformers_available,
+    is_xpu_available,
 )
 from ...utils.constants import (
     DEEPSPEED_MULTINODE_LAUNCHERS,
@@ -30,13 +36,16 @@ from ...utils.constants import (
     FSDP_BACKWARD_PREFETCH,
     FSDP_SHARDING_STRATEGY,
     FSDP_STATE_DICT_TYPE,
+    TORCH_DYNAMO_MODES,
 )
 from .config_args import ClusterConfig
 from .config_utils import (
+    DYNAMO_BACKENDS,
     _ask_field,
     _ask_options,
     _convert_distributed_mode,
     _convert_dynamo_backend,
+    _convert_fp8_backend,
     _convert_mixed_precision,
     _convert_yes_no_to_bool,
 )
@@ -45,7 +54,16 @@ from .config_utils import (
 def get_cluster_input():
     distributed_type = _ask_options(
         "Which type of machine are you using?",
-        ["No distributed training", "multi-CPU", "multi-GPU", "TPU"],
+        [
+            "No distributed training",
+            "multi-CPU",
+            "multi-XPU",
+            "multi-GPU",
+            "multi-NPU",
+            "multi-MLU",
+            "multi-MUSA",
+            "TPU",
+        ],
         _convert_distributed_mode,
     )
 
@@ -57,8 +75,16 @@ def get_cluster_input():
     main_process_port = None
     rdzv_backend = "static"
     same_network = True
+    debug = False
 
-    if distributed_type in [DistributedType.MULTI_GPU, DistributedType.MULTI_CPU]:
+    if distributed_type in [
+        DistributedType.MULTI_GPU,
+        DistributedType.MULTI_MLU,
+        DistributedType.MULTI_MUSA,
+        DistributedType.MULTI_NPU,
+        DistributedType.MULTI_XPU,
+        DistributedType.MULTI_CPU,
+    ]:
         num_machines = _ask_field(
             "How many different machines will you use (use more than 1 for multi-node training)? [1]: ",
             int,
@@ -87,10 +113,16 @@ def get_cluster_input():
                 rdzv_backend = _ask_field(
                     "What rendezvous backend will you use? ('static', 'c10d', ...): ", default="static"
                 )
+        debug = _ask_field(
+            "Should distributed operations be checked while running for errors? This can avoid timeout issues but will be slower. [yes/NO]: ",
+            _convert_yes_no_to_bool,
+            default=False,
+            error_message="Please enter yes or no.",
+        )
 
     if distributed_type == DistributedType.NO:
         use_cpu = _ask_field(
-            "Do you want to run your training on CPU only (even if a GPU / Apple Silicon device is available)? [yes/NO]:",
+            "Do you want to run your training on CPU only (even if a GPU / Apple Silicon / Ascend NPU device is available)? [yes/NO]:",
             _convert_yes_no_to_bool,
             default=False,
             error_message="Please enter yes or no.",
@@ -100,6 +132,50 @@ def get_cluster_input():
     else:
         use_cpu = False
 
+    ipex_config = {}
+    mpirun_config = {}
+    if use_cpu:
+        ipex_config["ipex"] = _ask_field(
+            "Do you want to use Intel PyTorch Extension (IPEX) to speed up training on CPU? [yes/NO]:",
+            _convert_yes_no_to_bool,
+            default=False,
+            error_message="Please enter yes or no.",
+        )
+        if distributed_type == DistributedType.MULTI_CPU:
+            use_mpirun = _ask_field(
+                "Do you want accelerate to launch mpirun? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
+            )
+            if use_mpirun:
+                mpirun_hostfile = _ask_field(
+                    "Please enter the path to the hostfile to use with mpirun [~/hostfile]: ",
+                    str,
+                    default="~/hostfile",
+                )
+                mpirun_config["mpirun_hostfile"] = os.path.expanduser(mpirun_hostfile.strip())
+                mpirun_config["mpirun_ccl"] = _ask_field("Enter the number of oneCCL worker threads [1]: ", default=1)
+    if (
+        not use_cpu
+        and is_xpu_available()
+        and distributed_type
+        not in [
+            DistributedType.MULTI_GPU,
+            DistributedType.MULTI_NPU,
+            DistributedType.MULTI_MLU,
+            DistributedType.XLA,
+            DistributedType.MULTI_MUSA,
+        ]
+    ):
+        ipex_config["use_xpu"] = _ask_field(
+            "Do you want to use XPU plugin to speed up training on XPU? [yes/NO]:",
+            _convert_yes_no_to_bool,
+            default=False,
+            error_message="Please enter yes or no.",
+        )
+
+    dynamo_config = {}
     use_dynamo = _ask_field(
         "Do you wish to optimize your script with torch dynamo?[yes/NO]:",
         _convert_yes_no_to_bool,
@@ -107,29 +183,54 @@ def get_cluster_input():
         error_message="Please enter yes or no.",
     )
     if use_dynamo:
-        dynamo_backend = _ask_options(
+        prefix = "dynamo_"
+        dynamo_config[prefix + "backend"] = _ask_options(
             "Which dynamo backend would you like to use?",
-            [
-                "eager",
-                "aot_eager",
-                "inductor",
-                "nvfuser",
-                "aot_nvfuser",
-                "aot_cudagraphs",
-                "ofi",
-                "fx2trt",
-                "onnxrt",
-                "ipex",
-            ],
+            [x.lower() for x in DYNAMO_BACKENDS],
             _convert_dynamo_backend,
             default=2,
         )
-    else:
-        dynamo_backend = DynamoBackend.NO
+        use_custom_options = _ask_field(
+            "Do you want to customize the defaults sent to torch.compile? [yes/NO]: ",
+            _convert_yes_no_to_bool,
+            default=False,
+            error_message="Please enter yes or no.",
+        )
+
+        if use_custom_options:
+            dynamo_config[prefix + "mode"] = _ask_options(
+                "Which mode do you want to use?",
+                TORCH_DYNAMO_MODES,
+                lambda x: TORCH_DYNAMO_MODES[int(x)],
+                default=0,
+            )
+            dynamo_config[prefix + "use_fullgraph"] = _ask_field(
+                "Do you want the fullgraph mode or it is ok to break model into several subgraphs? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
+            )
+            dynamo_config[prefix + "use_dynamic"] = _ask_field(
+                "Do you want to enable dynamic shape tracing? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
+            )
 
     use_mps = not use_cpu and is_mps_available()
     deepspeed_config = {}
-    if distributed_type in [DistributedType.MULTI_GPU, DistributedType.NO] and not use_mps:
+    if (
+        distributed_type
+        in [
+            DistributedType.MULTI_GPU,
+            DistributedType.MULTI_XPU,
+            DistributedType.MULTI_NPU,
+            DistributedType.MULTI_MLU,
+            DistributedType.MULTI_MUSA,
+            DistributedType.NO,
+        ]
+        and not use_mps
+    ):
         use_deepspeed = _ask_field(
             "Do you want to use DeepSpeed? [yes/NO]: ",
             _convert_yes_no_to_bool,
@@ -171,6 +272,18 @@ def get_cluster_input():
                     deepspeed_config["offload_param_device"] = _ask_options(
                         "Where to offload parameters?", deepspeed_devices, lambda x: deepspeed_devices[int(x)]
                     )
+                    if deepspeed_config["offload_param_device"] == "nvme":
+                        deepspeed_config["offload_param_nvme_path"] = _ask_field(
+                            "Nvme Path to offload parameters?",
+                            str,
+                            default="/nvme",
+                        )
+                    if deepspeed_config["offload_optimizer_device"] == "nvme":
+                        deepspeed_config["offload_optimizer_nvme_path"] = _ask_field(
+                            "Nvme Path to offload optimizer states?",
+                            str,
+                            default="/nvme",
+                        )
                 deepspeed_config["gradient_accumulation_steps"] = _ask_field(
                     "How many gradient accumulation steps you're passing in your script? [1]: ",
                     int,
@@ -207,6 +320,18 @@ def get_cluster_input():
                         "When `zero3_init_flag` is set, it requires Transformers to be installed. "
                         "Please run `pip3 install transformers`."
                     )
+            use_moe = _ask_field(
+                "Do you want to enable Mixture-of-Experts training (MoE)? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
+            )
+            if use_moe:
+                deepspeed_config["deepspeed_moe_layer_cls_names"] = _ask_field(
+                    "Specify the comma-separated list of transformers MoE layer class names (case-sensitive), e.g : "
+                    " `MixtralSparseMoeBlock`, `Qwen2MoeSparseMoeBlock`, `JetMoEAttention,JetMoEBlock` ... : ",
+                    str,
+                )
 
             if num_machines > 1:
                 launcher_query = "Which Type of launcher do you want to use?"
@@ -251,7 +376,13 @@ def get_cluster_input():
                         )
 
     fsdp_config = {}
-    if distributed_type in [DistributedType.MULTI_GPU]:
+    if distributed_type in [
+        DistributedType.MULTI_GPU,
+        DistributedType.MULTI_NPU,
+        DistributedType.MULTI_MLU,
+        DistributedType.MULTI_MUSA,
+        DistributedType.MULTI_XPU,
+    ]:
         use_fsdp = _ask_field(
             "Do you want to use FullyShardedDataParallel? [yes/NO]: ",
             _convert_yes_no_to_bool,
@@ -265,8 +396,7 @@ def get_cluster_input():
             fsdp_config["fsdp_sharding_strategy"] = _ask_options(
                 sharding_strategy_query,
                 FSDP_SHARDING_STRATEGY,
-                lambda x: int(x) + 1,
-                default=1,
+                lambda x: FSDP_SHARDING_STRATEGY[int(x)],
             )
             fsdp_config["fsdp_offload_params"] = _ask_field(
                 "Do you want to offload parameters and gradients to CPU? [yes/NO]: ",
@@ -281,18 +411,26 @@ def get_cluster_input():
                 lambda x: FSDP_AUTO_WRAP_POLICY[int(x)],
             )
             if fsdp_config["fsdp_auto_wrap_policy"] == FSDP_AUTO_WRAP_POLICY[0]:
-                fsdp_config["fsdp_transformer_layer_cls_to_wrap"] = _ask_field(
-                    "What is the transformer layer class name (case-sensitive) to wrap ,e.g, `BertLayer`, `GPTJBlock`, `T5Block` ...? : ",
-                    str,
+                use_no_split_modules = _ask_field(
+                    "Do you want to use the model's `_no_split_modules` to wrap. Only applicable for 🤗 Transformers [yes/NO]: ",
+                    _convert_yes_no_to_bool,
+                    default=False,
+                    error_message="Please enter yes or no.",
                 )
+                if not use_no_split_modules:
+                    fsdp_config["fsdp_transformer_layer_cls_to_wrap"] = _ask_field(
+                        "Specify the comma-separated list of transformer layer class names (case-sensitive) to wrap ,e.g, :"
+                        "`BertLayer`, `GPTJBlock`, `T5Block`, `BertLayer,BertEmbeddings,BertSelfOutput` ...? : ",
+                        str,
+                    )
             elif fsdp_config["fsdp_auto_wrap_policy"] == FSDP_AUTO_WRAP_POLICY[1]:
                 fsdp_config["fsdp_min_num_params"] = _ask_field(
                     "What should be your FSDP's minimum number of parameters for Default Auto Wrapping Policy? [1e8]: ",
                     int,
-                    default=1e8,
+                    default=100000000,
                 )
             fsdp_backward_prefetch_query = "What should be your FSDP's backward prefetch policy?"
-            fsdp_config["fsdp_backward_prefetch_policy"] = _ask_options(
+            fsdp_config["fsdp_backward_prefetch"] = _ask_options(
                 fsdp_backward_prefetch_query,
                 FSDP_BACKWARD_PREFETCH,
                 lambda x: FSDP_BACKWARD_PREFETCH[int(x)],
@@ -302,6 +440,40 @@ def get_cluster_input():
                 fsdp_state_dict_type_query,
                 FSDP_STATE_DICT_TYPE,
                 lambda x: FSDP_STATE_DICT_TYPE[int(x)],
+                default=2,
+            )
+            fsdp_config["fsdp_forward_prefetch"] = _ask_field(
+                "Do you want to enable FSDP's forward prefetch policy? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
+            )
+            fsdp_config["fsdp_use_orig_params"] = _ask_field(
+                "Do you want to enable FSDP's `use_orig_params` feature? [YES/no]: ",
+                _convert_yes_no_to_bool,
+                default=True,
+                error_message="Please enter yes or no.",
+            )
+            fsdp_config["fsdp_cpu_ram_efficient_loading"] = _ask_field(
+                "Do you want to enable CPU RAM efficient model loading? Only applicable for 🤗 Transformers models. [YES/no]: ",
+                _convert_yes_no_to_bool,
+                default=True,
+                error_message="Please enter yes or no.",
+            )
+            if fsdp_config["fsdp_cpu_ram_efficient_loading"]:
+                fsdp_config["fsdp_sync_module_states"] = True
+            else:
+                fsdp_config["fsdp_sync_module_states"] = _ask_field(
+                    "Do you want each individually wrapped FSDP unit to broadcast module parameters from rank 0 at the start? [YES/no]: ",
+                    _convert_yes_no_to_bool,
+                    default=True,
+                    error_message="Please enter yes or no.",
+                )
+            fsdp_config["fsdp_activation_checkpointing"] = _ask_field(
+                "Do you want to enable FSDP activation checkpointing? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
             )
 
     megatron_lm_config = {}
@@ -353,7 +525,7 @@ def get_cluster_input():
 
             megatron_lm_config[prefix + "use_distributed_optimizer"] = _ask_field(
                 "Do you want to use distributed optimizer "
-                "which shards optimizer state and gradients across data pralellel ranks? [YES/no]: ",
+                "which shards optimizer state and gradients across data parallel ranks? [YES/no]: ",
                 _convert_yes_no_to_bool,
                 default=True,
                 error_message="Please enter yes or no.",
@@ -375,10 +547,20 @@ def get_cluster_input():
     tpu_use_sudo = False
     tpu_use_cluster = False
 
-    if distributed_type in [DistributedType.MULTI_CPU, DistributedType.MULTI_GPU, DistributedType.TPU]:
+    if distributed_type in [
+        DistributedType.MULTI_CPU,
+        DistributedType.MULTI_XPU,
+        DistributedType.MULTI_GPU,
+        DistributedType.MULTI_MLU,
+        DistributedType.MULTI_MUSA,
+        DistributedType.MULTI_NPU,
+        DistributedType.XLA,
+    ]:
         machine_type = str(distributed_type).split(".")[1].replace("MULTI_", "")
         if machine_type == "TPU":
             machine_type += " cores"
+        elif machine_type == "CPU":
+            machine_type = "processes"
         else:
             machine_type += "(s)"
         num_processes = _ask_field(
@@ -397,13 +579,51 @@ def get_cluster_input():
     else:
         num_processes = 1
 
-    if distributed_type in [DistributedType.MULTI_GPU, DistributedType.NO] and not use_cpu and not use_mps:
+    if (distributed_type == DistributedType.MULTI_GPU) and (num_machines == 1) and (num_processes == 1):
+        raise ValueError(
+            f"Specified distributed type {distributed_type} but only using 1 GPU on a single machine. Please select `No distributed training` for the type of machine you are using."
+        )
+
+    if (
+        distributed_type
+        in [
+            DistributedType.MULTI_GPU,
+            DistributedType.MULTI_MLU,
+            DistributedType.MULTI_MUSA,
+            DistributedType.MULTI_NPU,
+            DistributedType.MULTI_XPU,
+            DistributedType.NO,
+        ]
+        and not use_cpu
+        and not use_mps
+    ):
+        if is_npu_available():
+            machine_type = "NPU(s)"
+        elif is_mlu_available():
+            machine_type = "MLU(s)"
+        elif is_musa_available():
+            machine_type = "MUSA(s)"
+        elif is_xpu_available():
+            machine_type = "XPU(s)"
+        else:
+            machine_type = "GPU(s)"
         gpu_ids = _ask_field(
-            "What GPU(s) (by id) should be used for training on this machine as a comma-seperated list? [all]:",
+            f"What {machine_type} (by id) should be used for training on this machine as a comma-seperated list? [all]:",
             default="all",
         )
 
-    if distributed_type == DistributedType.TPU:
+    # CPU affinity is only supported on NVIDIA hardware for now
+    enable_cpu_affinity = False
+    if distributed_type in (DistributedType.NO, DistributedType.MULTI_GPU) and not use_cpu and not use_mps:
+        enable_cpu_affinity = _ask_field(
+            "Would you like to enable numa efficiency? (Currently only supported on NVIDIA hardware). [yes/NO]: ",
+            _convert_yes_no_to_bool,
+            default=False,
+            error_message="Please enter yes or no.",
+        )
+
+    fp8_config = None
+    if distributed_type == DistributedType.XLA:
         mixed_precision = "no"
         main_training_function = _ask_field(
             "What is the name of the function in your script that should be launched in all parallel scripts? [main]: ",
@@ -484,17 +704,93 @@ def get_cluster_input():
             mixed_precision = None
         else:
             mixed_precision = _ask_options(
-                "Do you wish to use FP16 or BF16 (mixed precision)?",
-                ["no", "fp16", "bf16"],
+                "Do you wish to use mixed precision?",
+                ["no", "fp16", "bf16", "fp8"],
                 _convert_mixed_precision,
             )
+            if mixed_precision == "fp8":
+                if not is_fp8_available():
+                    raise ValueError("FP8 (either Transformer Engine or MSAMP) is not installed on this machine.")
+                fp8_config = {}
+                fp8_config["backend"] = _ask_options(
+                    "Which FP8 backend do you want to use?",
+                    ["te", "msamp"],
+                    _convert_fp8_backend,
+                )
+                if fp8_config["backend"] == "TE":
+                    if not is_transformer_engine_available():
+                        raise ValueError("TransformersEngine was selected, but it is not installed on this machine.")
+                    fp8_config["use_autocast_during_eval"] = _ask_field(
+                        "Do you want to use FP8 autocast during eval mode? Generally better metrics are found when this is disabled [yes/NO]: ",
+                        _convert_yes_no_to_bool,
+                        default=False,
+                    )
+                    fp8_config["margin"] = _ask_field(
+                        "What margin should be used for gradient scaling? [0]: ",
+                        int,
+                        default=0,
+                    )
+                    fp8_config["interval"] = _ask_field(
+                        "What interval should be used for for how often the scaling factor is recomputed? [1]: ",
+                        int,
+                        default=1,
+                    )
+                    fp8_config["fp8_format"] = _ask_options(
+                        "Which weight format should be used?",
+                        ["HYBRID", "E4M3"],
+                        lambda x: "HYBRID" if x == 0 else "E4M3",
+                        default=0,
+                    )
+                    fp8_config["amax_history_length"] = _ask_field(
+                        "What length of history should be used for the amax scaling factor computation? [1024]: ",
+                        int,
+                        default=1024,
+                    )
+                    fp8_config["amax_compute_algorithm"] = _ask_options(
+                        "Which algorithm should be used for the amax scaling factor computation?",
+                        ["max", "most_recent"],
+                        lambda x: "max" if x == 0 else "most_recent",
+                        default=0,
+                    )
+                    fp8_config["override_linear_precision"] = _ask_field(
+                        "Do you want to to execute `fprop`, `dgrad`, and `wgrad` GEMMS in higher precision? [yes/NO]: ",
+                        _convert_yes_no_to_bool,
+                        default=False,
+                    )
+                    if fp8_config["override_linear_precision"]:
+                        fprop = _ask_field(
+                            "Should `fprop` be executed in higher precision? [yes/NO]: ",
+                            _convert_yes_no_to_bool,
+                            default=False,
+                        )
+                        dgrad = _ask_field(
+                            "Should `dgrad` be executed in higher precision? [yes/NO]: ",
+                            _convert_yes_no_to_bool,
+                            default=False,
+                        )
+                        wgrad = _ask_field(
+                            "Should `wgrad` be executed in higher precision? [yes/NO]: ",
+                            _convert_yes_no_to_bool,
+                            default=False,
+                        )
+                        fp8_config["override_linear_precision"] = (fprop, dgrad, wgrad)
+
+                elif fp8_config["backend"] == "MSAMP":
+                    if not is_msamp_available():
+                        raise ValueError("MSAMP was selected, but it is not installed on this machine.")
+                    fp8_config["optimization_level"] = _ask_options(
+                        "Which optimization level should be used?",
+                        ["O1", "O2"],
+                        lambda x: "O1" if x == 0 else "O2",
+                        default=1,
+                    )
 
     if use_dynamo and mixed_precision == "no" and not use_cpu:
         print(
             "Torch dynamo used without mixed precision requires TF32 to be efficient. Accelerate will enable it by default when launching your scripts."
         )
 
-    if distributed_type == DistributedType.TPU and mixed_precision == "bf16":
+    if distributed_type == DistributedType.XLA and mixed_precision == "bf16":
         tpu_downcast_bf16 = _ask_field(
             "Should `torch.float` be cast as `bfloat16` and `torch.double` remain `float32` on TPUs?", default="no"
         )
@@ -511,9 +807,12 @@ def get_cluster_input():
         main_process_ip=main_process_ip,
         main_process_port=main_process_port,
         main_training_function=main_training_function,
+        fp8_config=fp8_config,
         deepspeed_config=deepspeed_config,
         fsdp_config=fsdp_config,
         megatron_lm_config=megatron_lm_config,
+        ipex_config=ipex_config,
+        mpirun_config=mpirun_config,
         use_cpu=use_cpu,
         rdzv_backend=rdzv_backend,
         same_network=same_network,
@@ -525,5 +824,7 @@ def get_cluster_input():
         tpu_zone=tpu_zone,
         tpu_use_sudo=tpu_use_sudo,
         tpu_use_cluster=tpu_use_cluster,
-        dynamo_backend=dynamo_backend,
+        dynamo_config=dynamo_config,
+        debug=debug,
+        enable_cpu_affinity=enable_cpu_affinity,
     )

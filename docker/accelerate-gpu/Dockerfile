@@ -1,10 +1,10 @@
-# Builds GPU docker image of PyTorch
+# Builds GPU docker image of PyTorch specifically
 # Uses multi-staged approach to reduce size
 # Stage 1
 # Use base conda image to reduce time
 FROM continuumio/miniconda3:latest AS compile-image
 # Specify py version
-ENV PYTHON_VERSION=3.7.3
+ENV PYTHON_VERSION=3.9
 # Install apt libs
 RUN apt-get update && \
     apt-get install -y curl git wget && \
@@ -19,14 +19,17 @@ ENV PATH /opt/conda/envs/accelerate/bin:$PATH
 # Activate our bash shell
 RUN chsh -s /bin/bash
 SHELL ["/bin/bash", "-c"]
-# Activate the conda env and install torch + accelerate
+# Activate the conda env, install mpy4pi, and install torch + accelerate
+RUN source activate accelerate && conda install -c conda-forge mpi4py
 RUN source activate accelerate && \
     python3 -m pip install --no-cache-dir \
     git+https://github.com/huggingface/accelerate#egg=accelerate[testing,test_trackers] \
-    --extra-index-url https://download.pytorch.org/whl/cu113
+    --extra-index-url https://download.pytorch.org/whl/cu117
+
+RUN python3 -m pip install --no-cache-dir bitsandbytes
 
 # Stage 2
-FROM nvidia/cuda:11.2.2-cudnn8-devel-ubuntu20.04 AS build-image
+FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu20.04 AS build-image
 COPY --from=compile-image /opt/conda /opt/conda
 ENV PATH /opt/conda/bin:$PATH
 

@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +34,7 @@ import datasets
 import torch
 import transformers
 from datasets import load_dataset
-from huggingface_hub import Repository
+from huggingface_hub import HfApi
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
@@ -48,7 +47,7 @@ from transformers import (
     default_data_collator,
     get_scheduler,
 )
-from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
+from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 from accelerate import Accelerator, DistributedType
@@ -216,7 +215,7 @@ def parse_args():
         default="all",
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
-            ' `"wandb"` and `"comet_ml"`. Use `"all"` (default) to report to all integrations.'
+            ' `"wandb"`, `"comet_ml"`, and `"dvclive"`. Use `"all"` (default) to report to all integrations.'
             "Only applicable when `--with_tracking` is passed."
         ),
     )
@@ -253,7 +252,7 @@ def main():
 
     if args.with_tracking:
         accelerator_log_kwargs["log_with"] = args.report_to
-        accelerator_log_kwargs["logging_dir"] = args.output_dir
+        accelerator_log_kwargs["project_dir"] = args.output_dir
 
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
 
@@ -278,11 +277,13 @@ def main():
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            repo = Repository(args.output_dir, clone_from=repo_name)
+            api = HfApi(token=args.hub_token)
+
+            # Create repo (repo_name from args or inferred)
+            repo_name = args.hub_model_id
+            if repo_name is None:
+                repo_name = Path(args.output_dir).absolute().name
+            repo_id = api.create_repo(repo_name, exist_ok=True).repo_id
 
             with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
                 if "step_*" not in gitignore:
@@ -405,7 +406,7 @@ def main():
                 f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). "
                 "Picking 1024 instead. You can change that default value by passing --block_size xxx."
             )
-        block_size = 1024
+            block_size = 1024
     else:
         if args.block_size > tokenizer.model_max_length:
             logger.warning(
@@ -506,7 +507,7 @@ def main():
     )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
-    if accelerator.distributed_type == DistributedType.TPU:
+    if accelerator.distributed_type == DistributedType.XLA:
         model.tie_weights()
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -662,8 +663,11 @@ def main():
             )
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
+                api.upload_folder(
+                    repo_id=repo_id,
+                    folder_path=args.output_dir,
+                    commit_message=f"Training in progress epoch {epoch}",
+                    run_as_future=True,
                 )
 
         if args.checkpointing_steps == "epoch":
@@ -691,10 +695,15 @@ def main():
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
             if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+                api.upload_folder(
+                    repo_id=repo_id,
+                    folder_path=args.output_dir,
+                    commit_message="End of training",
+                )
 
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump({"perplexity": perplexity}, f)
+    accelerator.end_training()
 
 
 if __name__ == "__main__":

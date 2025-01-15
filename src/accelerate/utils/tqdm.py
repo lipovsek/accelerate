@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from .imports import is_tqdm_available
 
 
 if is_tqdm_available():
-    import tqdm.auto as _tqdm
+    from tqdm.auto import tqdm as _tqdm
 
 from ..state import PartialState
 
 
-def tqdm(main_process_only: bool = True, *args, **kwargs):
+def tqdm(*args, main_process_only: bool = True, **kwargs):
     """
     Wrapper around `tqdm.tqdm` that optionally displays only on the main process.
 
@@ -31,7 +32,12 @@ def tqdm(main_process_only: bool = True, *args, **kwargs):
     """
     if not is_tqdm_available():
         raise ImportError("Accelerate's `tqdm` module requires `tqdm` to be installed. Please run `pip install tqdm`.")
-    disable = False
-    if main_process_only:
-        disable = PartialState().local_process_index == 0
+    if len(args) > 0 and isinstance(args[0], bool):
+        raise ValueError(
+            "Passing `True` or `False` as the first argument to Accelerate's `tqdm` wrapper is unsupported. "
+            "Please use the `main_process_only` keyword argument instead."
+        )
+    disable = kwargs.pop("disable", False)
+    if main_process_only and not disable:
+        disable = PartialState().local_process_index != 0
     return _tqdm(*args, **kwargs, disable=disable)

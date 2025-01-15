@@ -13,48 +13,100 @@
 # limitations under the License.
 
 import inspect
-import os
 import unittest
 
 import torch
 
-import accelerate
 from accelerate import Accelerator
-from accelerate.test_utils import execute_subprocess_async, require_multi_gpu
-from accelerate.utils import get_launch_prefix, patch_environment
+from accelerate.big_modeling import dispatch_model
+from accelerate.test_utils import (
+    DEFAULT_LAUNCH_COMMAND,
+    assert_exception,
+    device_count,
+    execute_subprocess_async,
+    get_launch_command,
+    path_in_accelerate_package,
+    require_huggingface_suite,
+    require_multi_device,
+    require_multi_gpu,
+    require_non_torch_xla,
+    require_non_xpu,
+    require_pippy,
+    require_torchvision,
+    torch_device,
+)
+from accelerate.utils import patch_environment
 
 
-class MultiGPUTester(unittest.TestCase):
-    def setUp(self):
-        mod_file = inspect.getfile(accelerate.test_utils)
-        self.test_file_path = os.path.sep.join(mod_file.split(os.path.sep)[:-1] + ["scripts", "test_script.py"])
-        self.data_loop_file_path = os.path.sep.join(
-            mod_file.split(os.path.sep)[:-1] + ["scripts", "test_distributed_data_loop.py"]
-        )
+class MultiDeviceTester(unittest.TestCase):
+    test_file_path = path_in_accelerate_package("test_utils", "scripts", "test_script.py")
+    data_loop_file_path = path_in_accelerate_package("test_utils", "scripts", "test_distributed_data_loop.py")
+    operation_file_path = path_in_accelerate_package("test_utils", "scripts", "test_ops.py")
+    pippy_file_path = path_in_accelerate_package("test_utils", "scripts", "external_deps", "test_pippy.py")
+    merge_weights_file_path = path_in_accelerate_package("test_utils", "scripts", "test_merge_weights.py")
 
-    @require_multi_gpu
-    def test_multi_gpu(self):
-        print(f"Found {torch.cuda.device_count()} devices.")
-        cmd = get_launch_prefix() + [self.test_file_path]
+    @require_multi_device
+    def test_multi_device(self):
+        print(f"Found {device_count} devices.")
+        cmd = DEFAULT_LAUNCH_COMMAND + [self.test_file_path]
         with patch_environment(omp_num_threads=1):
-            execute_subprocess_async(cmd, env=os.environ.copy())
+            execute_subprocess_async(cmd)
 
-    @require_multi_gpu
+    @require_multi_device
+    def test_multi_device_ops(self):
+        print(f"Found {device_count} devices.")
+        cmd = DEFAULT_LAUNCH_COMMAND + [self.operation_file_path]
+        with patch_environment(omp_num_threads=1):
+            execute_subprocess_async(cmd)
+
+    @require_multi_device
     def test_pad_across_processes(self):
-        cmd = get_launch_prefix() + [inspect.getfile(self.__class__)]
+        print(f"Found {device_count} devices.")
+        cmd = DEFAULT_LAUNCH_COMMAND + [inspect.getfile(self.__class__)]
         with patch_environment(omp_num_threads=1):
-            execute_subprocess_async(cmd, env=os.environ.copy())
+            execute_subprocess_async(cmd)
 
-    @require_multi_gpu
+    @require_multi_device
+    def test_multi_device_merge_fsdp_weights(self):
+        print(f"Found {device_count} devices.")
+        cmd = DEFAULT_LAUNCH_COMMAND + [self.merge_weights_file_path]
+        with patch_environment(omp_num_threads=1):
+            execute_subprocess_async(cmd)
+
+    @require_non_torch_xla
+    @require_multi_device
     def test_distributed_data_loop(self):
         """
         This TestCase checks the behaviour that occurs during distributed training or evaluation,
         when the batch size does not evenly divide the dataset size.
         """
-        print(f"Found {torch.cuda.device_count()} devices, using 2 devices only")
-        cmd = get_launch_prefix() + [f"--nproc_per_node={torch.cuda.device_count()}", self.data_loop_file_path]
-        with patch_environment(omp_num_threads=1, cuda_visible_devices="0,1"):
-            execute_subprocess_async(cmd, env=os.environ.copy())
+        print(f"Found {device_count} devices, using 2 devices only")
+        cmd = get_launch_command(num_processes=2) + [self.data_loop_file_path]
+        env_kwargs = dict(omp_num_threads=1)
+        if torch_device == "xpu":
+            env_kwargs.update(ze_affinity_mask="0,1")
+        elif torch_device == "npu":
+            env_kwargs.update(ascend_rt_visible_devices="0,1")
+        elif torch_device == "mlu":
+            env_kwargs.update(mlu_visible_devices="0,1")
+        else:
+            env_kwargs.update(cuda_visible_devices="0,1")
+        with patch_environment(**env_kwargs):
+            execute_subprocess_async(cmd)
+
+    @require_non_xpu
+    @require_multi_gpu
+    @require_pippy
+    @require_torchvision
+    @require_huggingface_suite
+    def test_pippy(self):
+        """
+        Checks the integration with the pippy framework
+        """
+        print(f"Found {device_count} devices")
+        cmd = get_launch_command(multi_gpu=True, num_processes=device_count) + [self.pippy_file_path]
+        with patch_environment(omp_num_threads=1):
+            execute_subprocess_async(cmd)
 
 
 if __name__ == "__main__":
@@ -84,3 +136,22 @@ if __name__ == "__main__":
     # Raise error at the end to make sure we don't stop at the first failure.
     if len(error_msg) > 0:
         raise ValueError(error_msg)
+
+    # Check device_map
+    accelerator.print("Test `device_map` cannot be prepared.")
+
+    class ModelForTest(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear1 = torch.nn.Linear(3, 4)
+            self.batchnorm = torch.nn.BatchNorm1d(4)
+            self.linear2 = torch.nn.Linear(4, 5)
+
+        def forward(self, x):
+            return self.linear2(self.batchnorm(self.linear1(x)))
+
+    device_map = {"linear1": 0, "batchnorm": "cpu", "linear2": 1}
+    model = ModelForTest()
+    dispatch_model(model, device_map=device_map)
+    with assert_exception(ValueError, "You can't train a model that has been loaded with"):
+        model = accelerator.prepare_model(model)

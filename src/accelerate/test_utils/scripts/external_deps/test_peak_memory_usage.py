@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2022 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +23,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 from accelerate import Accelerator, DistributedType
+from accelerate.utils import is_mlu_available, is_musa_available, is_npu_available, is_xpu_available
 from accelerate.utils.deepspeed import DummyOptim, DummyScheduler
 
 
@@ -40,16 +40,50 @@ def b2mb(x):
 class TorchTracemalloc:
     def __enter__(self):
         gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_max_memory_allocated()  # reset the peak gauge to zero
-        self.begin = torch.cuda.memory_allocated()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_max_memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.cuda.memory_allocated()
+        elif is_mlu_available():
+            torch.mlu.empty_cache()
+            torch.mlu.reset_max_memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.mlu.memory_allocated()
+        elif is_musa_available():
+            torch.musa.empty_cache()
+            torch.musa.reset_max_memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.musa.memory_allocated()
+        elif is_npu_available():
+            torch.npu.empty_cache()
+            torch.npu.reset_max_memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.npu.memory_allocated()
+        elif is_xpu_available():
+            torch.xpu.empty_cache()
+            torch.xpu.reset_max_memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.xpu.memory_allocated()
         return self
 
     def __exit__(self, *exc):
         gc.collect()
-        torch.cuda.empty_cache()
-        self.end = torch.cuda.memory_allocated()
-        self.peak = torch.cuda.max_memory_allocated()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            self.end = torch.cuda.memory_allocated()
+            self.peak = torch.cuda.max_memory_allocated()
+        elif is_mlu_available():
+            torch.mlu.empty_cache()
+            torch.mlu.memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.mlu.max_memory_allocated()
+        elif is_musa_available():
+            torch.musa.empty_cache()
+            torch.musa.memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.musa.max_memory_allocated()
+        elif is_npu_available():
+            torch.npu.empty_cache()
+            self.end = torch.npu.memory_allocated()
+            self.peak = torch.npu.max_memory_allocated()
+        elif is_xpu_available():
+            torch.xpu.empty_cache()
+            self.end = torch.xpu.memory_allocated()
+            self.peak = torch.xpu.max_memory_allocated()
         self.used = b2mb(self.end - self.begin)
         self.peaked = b2mb(self.peak - self.begin)
         # print(f"delta used/peak {self.used:4d}/{self.peaked:4d}")
@@ -98,7 +132,7 @@ def get_dataloaders(
 
     def collate_fn(examples):
         # On TPU it's best to pad everything to the same length or training will be very slow.
-        if accelerator.distributed_type == DistributedType.TPU:
+        if accelerator.distributed_type == DistributedType.XLA:
             return tokenizer.pad(examples, padding="max_length", max_length=128, return_tensors="pt")
         return tokenizer.pad(examples, padding="longest", return_tensors="pt")
 
@@ -190,13 +224,11 @@ def training_function(config, args):
                 overall_step += 1
 
         # Printing the GPU memory usage details such as allocated memory, peak memory, and total memory usage
-        accelerator.print("Memory before entering the train : {}".format(b2mb(tracemalloc.begin)))
-        accelerator.print("Memory consumed at the end of the train (end-begin): {}".format(tracemalloc.used))
-        accelerator.print("Peak Memory consumed during the train (max-begin): {}".format(tracemalloc.peaked))
+        accelerator.print(f"Memory before entering the train : {b2mb(tracemalloc.begin)}")
+        accelerator.print(f"Memory consumed at the end of the train (end-begin): {tracemalloc.used}")
+        accelerator.print(f"Peak Memory consumed during the train (max-begin): {tracemalloc.peaked}")
         accelerator.print(
-            "Total Peak Memory consumed during the train (max): {}".format(
-                tracemalloc.peaked + b2mb(tracemalloc.begin)
-            )
+            f"Total Peak Memory consumed during the train (max): {tracemalloc.peaked + b2mb(tracemalloc.begin)}"
         )
         train_total_peak_memory[f"epoch-{epoch}"] = tracemalloc.peaked + b2mb(tracemalloc.begin)
         if args.peak_memory_upper_bound is not None:
@@ -208,6 +240,7 @@ def training_function(config, args):
     if accelerator.is_main_process:
         with open(os.path.join(args.output_dir, "peak_memory_utilization.json"), "w") as f:
             json.dump(train_total_peak_memory, f)
+    accelerator.end_training()
 
 
 def main():

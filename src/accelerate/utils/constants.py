@@ -17,18 +17,35 @@ import operator as op
 
 SCALER_NAME = "scaler.pt"
 MODEL_NAME = "pytorch_model"
+SAFE_MODEL_NAME = "model"
 RNG_STATE_NAME = "random_states"
 OPTIMIZER_NAME = "optimizer"
 SCHEDULER_NAME = "scheduler"
+SAMPLER_NAME = "sampler"
+PROFILE_PATTERN_NAME = "profile_{suffix}.json"
+WEIGHTS_NAME = f"{MODEL_NAME}.bin"
+WEIGHTS_PATTERN_NAME = "pytorch_model{suffix}.bin"
+WEIGHTS_INDEX_NAME = f"{WEIGHTS_NAME}.index.json"
+SAFE_WEIGHTS_NAME = f"{SAFE_MODEL_NAME}.safetensors"
+SAFE_WEIGHTS_PATTERN_NAME = "model{suffix}.safetensors"
+SAFE_WEIGHTS_INDEX_NAME = f"{SAFE_WEIGHTS_NAME}.index.json"
 SAGEMAKER_PYTORCH_VERSION = "1.10.2"
 SAGEMAKER_PYTHON_VERSION = "py38"
 SAGEMAKER_TRANSFORMERS_VERSION = "4.17.0"
 SAGEMAKER_PARALLEL_EC2_INSTANCES = ["ml.p3.16xlarge", "ml.p3dn.24xlarge", "ml.p4dn.24xlarge"]
-FSDP_SHARDING_STRATEGY = ["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD"]
+FSDP_SHARDING_STRATEGY = ["FULL_SHARD", "SHARD_GRAD_OP", "NO_SHARD", "HYBRID_SHARD", "HYBRID_SHARD_ZERO2"]
 FSDP_AUTO_WRAP_POLICY = ["TRANSFORMER_BASED_WRAP", "SIZE_BASED_WRAP", "NO_WRAP"]
 FSDP_BACKWARD_PREFETCH = ["BACKWARD_PRE", "BACKWARD_POST", "NO_PREFETCH"]
 FSDP_STATE_DICT_TYPE = ["FULL_STATE_DICT", "LOCAL_STATE_DICT", "SHARDED_STATE_DICT"]
-DEEPSPEED_MULTINODE_LAUNCHERS = ["pdsh", "standard", "openmpi", "mvapich"]
+FSDP_PYTORCH_VERSION = (
+    "2.1.0.a0+32f93b1"  # Technically should be 2.1.0, but MS-AMP uses this specific prerelease in their Docker image.
+)
+FSDP_MODEL_NAME = "pytorch_model_fsdp"
+DEEPSPEED_MULTINODE_LAUNCHERS = ["pdsh", "standard", "openmpi", "mvapich", "mpich"]
+TORCH_DYNAMO_MODES = ["default", "reduce-overhead", "max-autotune"]
+ELASTIC_LOG_LINE_PREFIX_TEMPLATE_PYTORCH_VERSION = "2.2.0"
+XPU_PROFILING_AVAILABLE_PYTORCH_VERSION = "2.4.0"
+MITA_PROFILING_AVAILABLE_PYTORCH_VERSION = "2.1.0"
 
 STR_OPERATION_TO_FUNC = {">": op.gt, ">=": op.ge, "==": op.eq, "!=": op.ne, "<=": op.le, "<": op.lt}
 
@@ -60,3 +77,10 @@ TORCH_LAUNCH_PARAMS = [
 ]
 
 CUDA_DISTRIBUTED_TYPES = ["DEEPSPEED", "MULTI_GPU", "FSDP", "MEGATRON_LM"]
+TORCH_DISTRIBUTED_OPERATION_TYPES = CUDA_DISTRIBUTED_TYPES + [
+    "MULTI_NPU",
+    "MULTI_MLU",
+    "MULTI_MUSA",
+    "MULTI_XPU",
+    "MULTI_CPU",
+]

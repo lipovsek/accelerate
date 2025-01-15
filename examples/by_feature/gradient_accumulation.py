@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -81,9 +80,22 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
 
     def collate_fn(examples):
         # On TPU it's best to pad everything to the same length or training will be very slow.
-        if accelerator.distributed_type == DistributedType.TPU:
-            return tokenizer.pad(examples, padding="max_length", max_length=128, return_tensors="pt")
-        return tokenizer.pad(examples, padding="longest", return_tensors="pt")
+        max_length = 128 if accelerator.distributed_type == DistributedType.XLA else None
+        # When using mixed precision we want round multiples of 8/16
+        if accelerator.mixed_precision == "fp8":
+            pad_to_multiple_of = 16
+        elif accelerator.mixed_precision != "no":
+            pad_to_multiple_of = 8
+        else:
+            pad_to_multiple_of = None
+
+        return tokenizer.pad(
+            examples,
+            padding="longest",
+            max_length=max_length,
+            pad_to_multiple_of=pad_to_multiple_of,
+            return_tensors="pt",
+        )
 
     # Instantiate dataloaders.
     train_dataloader = DataLoader(
@@ -113,7 +125,7 @@ def training_function(config, args):
     accelerator = Accelerator(
         cpu=args.cpu, mixed_precision=args.mixed_precision, gradient_accumulation_steps=gradient_accumulation_steps
     )
-    if accelerator.distributed_type == DistributedType.TPU and gradient_accumulation_steps > 1:
+    if accelerator.distributed_type == DistributedType.XLA and gradient_accumulation_steps > 1:
         raise NotImplementedError(
             "Gradient accumulation on TPUs is currently not supported. Pass `gradient_accumulation_steps=1`"
         )
@@ -185,6 +197,7 @@ def training_function(config, args):
         eval_metric = metric.compute()
         # Use accelerator.print to print only on the main process.
         accelerator.print(f"epoch {epoch}:", eval_metric)
+    accelerator.end_training()
 
 
 def main():
@@ -193,7 +206,7 @@ def main():
         "--mixed_precision",
         type=str,
         default=None,
-        choices=["no", "fp16", "bf16"],
+        choices=["no", "fp16", "bf16", "fp8"],
         help="Whether to use mixed precision. Choose"
         "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
         "and an Nvidia Ampere GPU.",

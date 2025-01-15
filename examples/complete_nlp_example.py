@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +21,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
-from accelerate import Accelerator, DistributedType
+from accelerate import Accelerator, DataLoaderConfiguration, DistributedType
 
 
 ########################################################################
@@ -50,12 +49,19 @@ EVAL_BATCH_SIZE = 32
 
 def training_function(config, args):
     # Initialize accelerator
+    dataloader_config = DataLoaderConfiguration(use_stateful_dataloader=args.use_stateful_dataloader)
     if args.with_tracking:
         accelerator = Accelerator(
-            cpu=args.cpu, mixed_precision=args.mixed_precision, log_with="all", logging_dir=args.logging_dir
+            cpu=args.cpu,
+            mixed_precision=args.mixed_precision,
+            dataloader_config=dataloader_config,
+            log_with="all",
+            project_dir=args.project_dir,
         )
     else:
-        accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision)
+        accelerator = Accelerator(
+            cpu=args.cpu, mixed_precision=args.mixed_precision, dataloader_config=dataloader_config
+        )
 
     if hasattr(args.checkpointing_steps, "isdigit"):
         if args.checkpointing_steps == "epoch":
@@ -103,15 +109,28 @@ def training_function(config, args):
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
-    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.TPU:
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.XLA:
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
     def collate_fn(examples):
         # On TPU it's best to pad everything to the same length or training will be very slow.
-        if accelerator.distributed_type == DistributedType.TPU:
-            return tokenizer.pad(examples, padding="max_length", max_length=128, return_tensors="pt")
-        return tokenizer.pad(examples, padding="longest", return_tensors="pt")
+        max_length = 128 if accelerator.distributed_type == DistributedType.XLA else None
+        # When using mixed precision we want round multiples of 8/16
+        if accelerator.mixed_precision == "fp8":
+            pad_to_multiple_of = 16
+        elif accelerator.mixed_precision != "no":
+            pad_to_multiple_of = 8
+        else:
+            pad_to_multiple_of = None
+
+        return tokenizer.pad(
+            examples,
+            padding="longest",
+            max_length=max_length,
+            pad_to_multiple_of=pad_to_multiple_of,
+            return_tensors="pt",
+        )
 
     # Instantiate dataloaders.
     train_dataloader = DataLoader(
@@ -182,9 +201,15 @@ def training_function(config, args):
             total_loss = 0
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
             # We need to skip steps until we reach the resumed step
-            train_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+            if not args.use_stateful_dataloader:
+                active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+            else:
+                active_dataloader = train_dataloader
             overall_step += resume_step
-        for step, batch in enumerate(train_dataloader):
+        else:
+            # After the first iteration though, we need to go back to the original dataloader
+            active_dataloader = train_dataloader
+        for step, batch in enumerate(active_dataloader):
             # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch.to(accelerator.device)
             outputs = model(**batch)
@@ -241,8 +266,7 @@ def training_function(config, args):
                 output_dir = os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir)
 
-    if args.with_tracking:
-        accelerator.end_training()
+    accelerator.end_training()
 
 
 def main():
@@ -251,7 +275,7 @@ def main():
         "--mixed_precision",
         type=str,
         default=None,
-        choices=["no", "fp16", "bf16"],
+        choices=["no", "fp16", "bf16", "fp8"],
         help="Whether to use mixed precision. Choose"
         "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
         "and an Nvidia Ampere GPU.",
@@ -270,6 +294,11 @@ def main():
         help="If the training should continue from a checkpoint folder.",
     )
     parser.add_argument(
+        "--use_stateful_dataloader",
+        action="store_true",
+        help="If the dataloader should be a resumable stateful dataloader.",
+    )
+    parser.add_argument(
         "--with_tracking",
         action="store_true",
         help="Whether to load in all available experiment trackers from the environment and use them for logging.",
@@ -281,10 +310,10 @@ def main():
         help="Optional save directory where all checkpoint folders will be stored. Default is the current working directory.",
     )
     parser.add_argument(
-        "--logging_dir",
+        "--project_dir",
         type=str,
         default="logs",
-        help="Location on where to store experiment tracking logs`",
+        help="Location on where to store experiment tracking logs` and relevent project information",
     )
     args = parser.parse_args()
     config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}

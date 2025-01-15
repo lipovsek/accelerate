@@ -67,7 +67,7 @@ doc-builder preview {package_name} {path_to_docs}
 For example:
 
 ```bash
-doc-builder preview transformers docs/source/en/
+doc-builder preview accelerate docs/source/
 ```
 
 The docs will be viewable at [http://localhost:3000](http://localhost:3000). You can also preview the docs once you have opened a PR. You will see a bot add a comment to a link where the documentation with your changes lives.
@@ -81,7 +81,7 @@ The `preview` command only works with existing doc files. When you add a complet
 
 ## Adding a new element to the navigation bar
 
-Accepted files are Markdown (.md or .mdx).
+Accepted files are Markdown (.md).
 
 Create a file with its extension and put it in the source directory. You can then link it to the toc-tree by putting
 the filename without the extension in the [`_toctree.yml`](https://github.com/huggingface/accelerate/blob/main/docs/source/_toctree.yml) file.

@@ -19,12 +19,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
-
-from ..logging import get_logger
-from .imports import is_safetensors_available
-
-
-logger = get_logger(__name__)
+from safetensors import safe_open
 
 
 def offload_weight(weight, weight_name, offload_folder, index=None):
@@ -77,7 +72,7 @@ def save_offload_index(index, offload_folder):
 
     offload_index_file = os.path.join(offload_folder, "index.json")
     if os.path.isfile(offload_index_file):
-        with open(offload_index_file, "r", encoding="utf-8") as f:
+        with open(offload_index_file, encoding="utf-8") as f:
             current_index = json.load(f)
     else:
         current_index = {}
@@ -150,8 +145,8 @@ class OffloadedWeightsLoader(Mapping):
         index: Mapping = None,
         device=None,
     ):
-        if state_dict is None and save_folder is None:
-            raise ValueError("Need either a `state_dict` or a `save_folder` containing offloaded weights.")
+        if state_dict is None and save_folder is None and index is None:
+            raise ValueError("Need either a `state_dict`, a `save_folder` or an `index` containing offloaded weights.")
 
         self.state_dict = {} if state_dict is None else state_dict
         self.save_folder = save_folder
@@ -169,23 +164,22 @@ class OffloadedWeightsLoader(Mapping):
             return self.state_dict[key]
         weight_info = self.index[key]
         if weight_info.get("safetensors_file") is not None:
-            if not is_safetensors_available():
-                raise ImportError("These offloaded weights require the use of safetensors: `pip install safetensors`.")
-
-            if "SAFETENSORS_FAST_GPU" not in os.environ:
-                logger.info("Enabling fast loading with safetensors by setting `SAFETENSORS_FAST_GPU` to 1.")
-                os.environ["SAFETENSORS_FAST_GPU"] = "1"
-
-            from safetensors import safe_open
-
             device = "cpu" if self.device is None else self.device
-            with safe_open(weight_info["safetensors_file"], framework="pt", device=device) as f:
-                tensor = f.get_tensor(weight_info.get("weight_name", key))
+            tensor = None
+            try:
+                with safe_open(weight_info["safetensors_file"], framework="pt", device=device) as f:
+                    tensor = f.get_tensor(weight_info.get("weight_name", key))
+            except TypeError:
+                # if failed to get_tensor on the device, such as bf16 on mps, try to load it on CPU first
+                with safe_open(weight_info["safetensors_file"], framework="pt", device="cpu") as f:
+                    tensor = f.get_tensor(weight_info.get("weight_name", key))
 
             if "dtype" in weight_info:
-                return tensor.to(getattr(torch, weight_info["dtype"]))
-            else:
-                return tensor
+                tensor = tensor.to(getattr(torch, weight_info["dtype"]))
+
+            if tensor.device != torch.device(device):
+                tensor = tensor.to(device)
+            return tensor
 
         weight_file = os.path.join(self.save_folder, f"{key}.dat")
         return load_offloaded_weight(weight_file, weight_info)

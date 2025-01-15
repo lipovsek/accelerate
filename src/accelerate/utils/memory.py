@@ -19,9 +19,45 @@ A collection of utilities for ensuring that training can always occur. Heavily i
 
 import functools
 import gc
+import importlib
 import inspect
+import warnings
 
 import torch
+from packaging import version
+
+from .imports import (
+    is_cuda_available,
+    is_ipex_available,
+    is_mlu_available,
+    is_mps_available,
+    is_musa_available,
+    is_npu_available,
+    is_xpu_available,
+)
+from .versions import compare_versions
+
+
+def clear_device_cache(garbage_collection=False):
+    """
+    Clears the device cache by calling `torch.{backend}.empty_cache`. Can also run `gc.collect()`, but do note that
+    this is a *considerable* slowdown and should be used sparingly.
+    """
+    if garbage_collection:
+        gc.collect()
+
+    if is_xpu_available():
+        torch.xpu.empty_cache()
+    elif is_mlu_available():
+        torch.mlu.empty_cache()
+    elif is_musa_available():
+        torch.musa.empty_cache()
+    elif is_npu_available():
+        torch.npu.empty_cache()
+    elif is_mps_available(min_version="2.0"):
+        torch.mps.empty_cache()
+    elif is_cuda_available():
+        torch.cuda.empty_cache()
 
 
 def release_memory(*objects):
@@ -50,14 +86,13 @@ def release_memory(*objects):
         objects = list(objects)
     for i in range(len(objects)):
         objects[i] = None
-    gc.collect()
-    torch.cuda.empty_cache()
+    clear_device_cache(garbage_collection=True)
     return objects
 
 
 def should_reduce_batch_size(exception: Exception) -> bool:
     """
-    Checks if `exception` relates to CUDA out-of-memory, CUDNN not supported, or CPU out-of-memory
+    Checks if `exception` relates to CUDA out-of-memory, XPU out-of-memory, CUDNN not supported, or CPU out-of-memory
 
     Args:
         exception (`Exception`):
@@ -65,6 +100,7 @@ def should_reduce_batch_size(exception: Exception) -> bool:
     """
     _statements = [
         "CUDA out of memory.",  # CUDA OOM
+        "XPU out of memory.",  # XPU OOM
         "cuDNN error: CUDNN_STATUS_NOT_SUPPORTED.",  # CUDNN SNAFU
         "DefaultCPUAllocator: can't allocate memory",  # CPU OOM
     ]
@@ -107,8 +143,7 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
 
     def decorator(*args, **kwargs):
         nonlocal batch_size
-        gc.collect()
-        torch.cuda.empty_cache()
+        clear_device_cache(garbage_collection=True)
         params = list(inspect.signature(function).parameters.keys())
         # Guard against user error
         if len(params) < (len(args) + 1):
@@ -124,10 +159,34 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
                 return function(batch_size, *args, **kwargs)
             except Exception as e:
                 if should_reduce_batch_size(e):
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    clear_device_cache(garbage_collection=True)
                     batch_size //= 2
                 else:
                     raise
 
     return decorator
+
+
+def get_xpu_available_memory(device_index: int):
+    if is_ipex_available():
+        ipex_version = version.parse(importlib.metadata.version("intel_extension_for_pytorch"))
+        if compare_versions(ipex_version, ">=", "2.5"):
+            from intel_extension_for_pytorch.xpu import mem_get_info
+
+            return mem_get_info(device_index)[0]
+    elif version.parse(torch.__version__).release >= version.parse("2.6").release:
+        # torch.xpu.mem_get_info API is available starting from PyTorch 2.6
+        # It further requires PyTorch built with the SYCL runtime which supports API
+        # to query available device memory. If not available, exception will be
+        # raised. Version of SYCL runtime used to build PyTorch is being reported
+        # with print(torch.version.xpu) and corresponds to the version of Intel DPC++
+        # SYCL compiler. First version to support required feature is 20250001.
+        try:
+            return torch.xpu.mem_get_info(device_index)[0]
+        except Exception:
+            pass
+
+    warnings.warn(
+        "The XPU `mem_get_info` API is available in IPEX version >=2.5 or PyTorch >=2.6. The current returned available memory is incorrect. Please consider upgrading your IPEX or PyTorch version."
+    )
+    return torch.xpu.max_memory_allocated(device_index)

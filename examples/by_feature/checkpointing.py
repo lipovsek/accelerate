@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,9 +19,10 @@ import torch
 from datasets import load_dataset
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
-from accelerate import Accelerator, DistributedType
+from accelerate import Accelerator, DataLoaderConfiguration, DistributedType
+from accelerate.utils import set_seed
 
 
 ########################################################################
@@ -86,9 +86,22 @@ def get_dataloaders(accelerator: Accelerator, batch_size: int = 16):
 
     def collate_fn(examples):
         # On TPU it's best to pad everything to the same length or training will be very slow.
-        if accelerator.distributed_type == DistributedType.TPU:
-            return tokenizer.pad(examples, padding="max_length", max_length=128, return_tensors="pt")
-        return tokenizer.pad(examples, padding="longest", return_tensors="pt")
+        max_length = 128 if accelerator.distributed_type == DistributedType.XLA else None
+        # When using mixed precision we want round multiples of 8/16
+        if accelerator.mixed_precision == "fp8":
+            pad_to_multiple_of = 16
+        elif accelerator.mixed_precision != "no":
+            pad_to_multiple_of = 8
+        else:
+            pad_to_multiple_of = None
+
+        return tokenizer.pad(
+            examples,
+            padding="longest",
+            max_length=max_length,
+            pad_to_multiple_of=pad_to_multiple_of,
+            return_tensors="pt",
+        )
 
     # Instantiate dataloaders.
     train_dataloader = DataLoader(
@@ -113,7 +126,8 @@ def training_function(config, args):
     if os.environ.get("TESTING_MOCKED_DATALOADERS", None) == "1":
         config["num_epochs"] = 2
     # Initialize accelerator
-    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision)
+    dataloader_config = DataLoaderConfiguration(use_stateful_dataloader=args.use_stateful_dataloader)
+    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision, dataloader_config=dataloader_config)
     # Sample hyper-parameters for learning rate, batch size, seed and a few other HPs
     lr = config["lr"]
     num_epochs = int(config["num_epochs"])
@@ -141,7 +155,7 @@ def training_function(config, args):
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
-    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.TPU:
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.XLA:
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
@@ -205,10 +219,16 @@ def training_function(config, args):
         model.train()
         # New Code #
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
-            # We need to skip steps until we reach the resumed step
-            train_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+            # We need to skip steps until we reach the resumed step only if we are not using a stateful dataloader
+            if not args.use_stateful_dataloader:
+                active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+            else:
+                active_dataloader = train_dataloader
             overall_step += resume_step
-        for step, batch in enumerate(train_dataloader):
+        else:
+            # After the first iteration though, we need to go back to the original dataloader
+            active_dataloader = train_dataloader
+        for step, batch in enumerate(active_dataloader):
             # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch.to(accelerator.device)
             outputs = model(**batch)
@@ -233,7 +253,6 @@ def training_function(config, args):
                     if args.output_dir is not None:
                         output_dir = os.path.join(args.output_dir, output_dir)
                     accelerator.save_state(output_dir)
-
         model.eval()
         for step, batch in enumerate(eval_dataloader):
             # We could avoid this line since we set the accelerator with `device_placement=True` (the default).
@@ -246,7 +265,6 @@ def training_function(config, args):
                 predictions=predictions,
                 references=references,
             )
-
         eval_metric = metric.compute()
         # Use accelerator.print to print only on the main process.
         accelerator.print(f"epoch {epoch}:", eval_metric)
@@ -261,6 +279,7 @@ def training_function(config, args):
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir)
+    accelerator.end_training()
 
 
 def main():
@@ -269,7 +288,7 @@ def main():
         "--mixed_precision",
         type=str,
         default=None,
-        choices=["no", "fp16", "bf16"],
+        choices=["no", "fp16", "bf16", "fp8"],
         help="Whether to use mixed precision. Choose"
         "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
         "and an Nvidia Ampere GPU.",
@@ -292,6 +311,11 @@ def main():
         type=str,
         default=None,
         help="If the training should continue from a checkpoint folder.",
+    )
+    parser.add_argument(
+        "--use_stateful_dataloader",
+        action="store_true",
+        help="If the dataloader should be a resumable stateful dataloader.",
     )
     args = parser.parse_args()
     config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}

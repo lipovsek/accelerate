@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,14 +14,23 @@
 import argparse
 import gc
 import os
+import threading
 
 import evaluate
+import psutil
 import torch
 from datasets import load_dataset
+from torch.distributed.fsdp.fully_sharded_data_parallel import FullOptimStateDictConfig, FullStateDictConfig
 from torch.utils.data import DataLoader
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    get_linear_schedule_with_warmup,
+    set_seed,
+)
 
-from accelerate import Accelerator, DistributedType
+from accelerate import Accelerator, DistributedType, FullyShardedDataParallelPlugin
+from accelerate.utils import is_npu_available, is_xpu_available
 
 
 ########################################################################
@@ -60,18 +68,65 @@ def b2mb(x):
 class TorchTracemalloc:
     def __enter__(self):
         gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_max_memory_allocated()  # reset the peak gauge to zero
-        self.begin = torch.cuda.memory_allocated()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_max_memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.cuda.memory_allocated()
+        elif is_xpu_available():
+            torch.xpu.empty_cache()
+            torch.xpu.reset_max_memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.xpu.memory_allocated()
+        elif is_npu_available():
+            torch.npu.empty_cache()
+            torch.npu.reset_max_memory_allocated()  # reset the peak gauge to zero
+            self.begin = torch.npu.memory_allocated()
+        self.process = psutil.Process()
+
+        self.cpu_begin = self.cpu_mem_used()
+        self.peak_monitoring = True
+        peak_monitor_thread = threading.Thread(target=self.peak_monitor_func)
+        peak_monitor_thread.daemon = True
+        peak_monitor_thread.start()
         return self
 
+    def cpu_mem_used(self):
+        """get resident set size memory for the current process"""
+        return self.process.memory_info().rss
+
+    def peak_monitor_func(self):
+        self.cpu_peak = -1
+
+        while True:
+            self.cpu_peak = max(self.cpu_mem_used(), self.cpu_peak)
+
+            # can't sleep or will not catch the peak right (this comment is here on purpose)
+            # time.sleep(0.001) # 1msec
+
+            if not self.peak_monitoring:
+                break
+
     def __exit__(self, *exc):
+        self.peak_monitoring = False
+
         gc.collect()
-        torch.cuda.empty_cache()
-        self.end = torch.cuda.memory_allocated()
-        self.peak = torch.cuda.max_memory_allocated()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            self.end = torch.cuda.memory_allocated()
+            self.peak = torch.cuda.max_memory_allocated()
+        elif is_xpu_available():
+            torch.xpu.empty_cache()
+            self.end = torch.xpu.memory_allocated()
+            self.peak = torch.xpu.max_memory_allocated()
+        elif is_npu_available():
+            torch.npu.empty_cache()
+            self.end = torch.npu.memory_allocated()
+            self.peak = torch.npu.max_memory_allocated()
         self.used = b2mb(self.end - self.begin)
         self.peaked = b2mb(self.peak - self.begin)
+
+        self.cpu_end = self.cpu_mem_used()
+        self.cpu_used = b2mb(self.cpu_end - self.cpu_begin)
+        self.cpu_peaked = b2mb(self.cpu_peak - self.cpu_begin)
         # print(f"delta used/peak {self.used:4d}/{self.peaked:4d}")
 
 
@@ -86,13 +141,25 @@ def training_function(config, args):
     # For testing only
     if os.environ.get("TESTING_MOCKED_DATALOADERS", None) == "1":
         config["num_epochs"] = 2
+
+    # New Code #
+    # Pass the advanced FSDP settings not part of the accelerate config by creating fsdp_plugin
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        state_dict_config=FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
+        optim_state_dict_config=FullOptimStateDictConfig(offload_to_cpu=False, rank0_only=False),
+    )
+
     # Initialize accelerator
     if args.with_tracking:
         accelerator = Accelerator(
-            cpu=args.cpu, mixed_precision=args.mixed_precision, log_with="wandb", logging_dir=args.logging_dir
+            cpu=args.cpu,
+            mixed_precision=args.mixed_precision,
+            log_with="wandb",
+            project_dir=args.logging_dir,
+            fsdp_plugin=fsdp_plugin,
         )
     else:
-        accelerator = Accelerator()
+        accelerator = Accelerator(fsdp_plugin=fsdp_plugin)
     accelerator.print(accelerator.distributed_type)
 
     if hasattr(args.checkpointing_steps, "isdigit"):
@@ -141,15 +208,28 @@ def training_function(config, args):
 
     # If the batch size is too big we use gradient accumulation
     gradient_accumulation_steps = 1
-    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.TPU:
+    if batch_size > MAX_GPU_BATCH_SIZE and accelerator.distributed_type != DistributedType.XLA:
         gradient_accumulation_steps = batch_size // MAX_GPU_BATCH_SIZE
         batch_size = MAX_GPU_BATCH_SIZE
 
     def collate_fn(examples):
         # On TPU it's best to pad everything to the same length or training will be very slow.
-        if accelerator.distributed_type == DistributedType.TPU:
-            return tokenizer.pad(examples, padding="max_length", max_length=128, return_tensors="pt")
-        return tokenizer.pad(examples, padding="longest", return_tensors="pt")
+        max_length = 128 if accelerator.distributed_type == DistributedType.XLA else None
+        # When using mixed precision we want round multiples of 8/16
+        if accelerator.mixed_precision == "fp8":
+            pad_to_multiple_of = 16
+        elif accelerator.mixed_precision != "no":
+            pad_to_multiple_of = 8
+        else:
+            pad_to_multiple_of = None
+
+        return tokenizer.pad(
+            examples,
+            padding="longest",
+            max_length=max_length,
+            pad_to_multiple_of=pad_to_multiple_of,
+            return_tensors="pt",
+        )
 
     # Instantiate dataloaders.
     train_dataloader = DataLoader(
@@ -162,17 +242,23 @@ def training_function(config, args):
     set_seed(seed)
 
     # Instantiate the model (we build the model here so that the seed also control new weights initialization)
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, return_dict=True)
-    # New Code #
-    # For FSDP feature, it is highly recommended and efficient to prepare the model before creating optimizer
-    model = accelerator.prepare(model)
-    accelerator.print(model)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name_or_path, return_dict=True, low_cpu_mem_usage=True
+    )
 
-    # Instantiate optimizer
-    # New Code #
-    # For FSDP feature, at present it doesn't support multiple parameter groups,
-    # so we need to create a single parameter group for the whole model
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=lr, weight_decay=2e-4)
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": 0.003,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    optimizer = torch.optim.AdamW(params=optimizer_grouped_parameters, lr=lr, weight_decay=2e-4)
 
     # Instantiate scheduler
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -181,13 +267,8 @@ def training_function(config, args):
         num_training_steps=(len(train_dataloader) * num_epochs) // gradient_accumulation_steps,
     )
 
-    # New Code #
-    # For FSDP feature, prepare everything except the model as we have already prepared the model
-    # before creating the optimizer
-    # There is no specific order to remember, we just need to unpack the objects in the same order we gave them to the
-    # prepare method.
-    optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
     overall_step = 0
@@ -232,7 +313,6 @@ def training_function(config, args):
                 batch.to(accelerator.device)
                 outputs = model(**batch)
                 loss = outputs.loss
-                loss = loss / gradient_accumulation_steps
                 # We keep track of the loss at each epoch
                 if args.with_tracking:
                     total_loss += loss.detach().float()
@@ -253,13 +333,11 @@ def training_function(config, args):
                         accelerator.save_state(output_dir)
         # New Code #
         # Printing the GPU memory usage details such as allocated memory, peak memory, and total memory usage
-        accelerator.print("Memory before entering the train : {}".format(b2mb(tracemalloc.begin)))
-        accelerator.print("Memory consumed at the end of the train (end-begin): {}".format(tracemalloc.used))
-        accelerator.print("Peak Memory consumed during the train (max-begin): {}".format(tracemalloc.peaked))
+        accelerator.print(f"Memory before entering the train : {b2mb(tracemalloc.begin)}")
+        accelerator.print(f"Memory consumed at the end of the train (end-begin): {tracemalloc.used}")
+        accelerator.print(f"Peak Memory consumed during the train (max-begin): {tracemalloc.peaked}")
         accelerator.print(
-            "Total Peak Memory consumed during the train (max): {}".format(
-                tracemalloc.peaked + b2mb(tracemalloc.begin)
-            )
+            f"Total Peak Memory consumed during the train (max): {tracemalloc.peaked + b2mb(tracemalloc.begin)}"
         )
         # Logging the peak memory usage of the GPU to the tracker
         if args.with_tracking:
@@ -306,11 +384,11 @@ def training_function(config, args):
                 accelerator.save_state(output_dir)
         # New Code #
         # Printing the GPU memory usage details such as allocated memory, peak memory, and total memory usage
-        accelerator.print("Memory before entering the eval : {}".format(b2mb(tracemalloc.begin)))
-        accelerator.print("Memory consumed at the end of the eval (end-begin): {}".format(tracemalloc.used))
-        accelerator.print("Peak Memory consumed during the eval (max-begin): {}".format(tracemalloc.peaked))
+        accelerator.print(f"Memory before entering the eval : {b2mb(tracemalloc.begin)}")
+        accelerator.print(f"Memory consumed at the end of the eval (end-begin): {tracemalloc.used}")
+        accelerator.print(f"Peak Memory consumed during the eval (max-begin): {tracemalloc.peaked}")
         accelerator.print(
-            "Total Peak Memory consumed during the eval (max): {}".format(tracemalloc.peaked + b2mb(tracemalloc.begin))
+            f"Total Peak Memory consumed during the eval (max): {tracemalloc.peaked + b2mb(tracemalloc.begin)}"
         )
         # Logging the peak memory usage of the GPU to the tracker
         if args.with_tracking:
@@ -321,8 +399,7 @@ def training_function(config, args):
                 step=epoch,
             )
 
-    if args.with_tracking:
-        accelerator.end_training()
+    accelerator.end_training()
 
 
 def main():
@@ -331,7 +408,7 @@ def main():
         "--mixed_precision",
         type=str,
         default=None,
-        choices=["no", "fp16", "bf16"],
+        choices=["no", "fp16", "bf16", "fp8"],
         help="Whether to use mixed precision. Choose"
         "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
         "and an Nvidia Ampere GPU.",
@@ -373,7 +450,7 @@ def main():
         required=True,
     )
     args = parser.parse_args()
-    config = {"lr": 2e-5, "num_epochs": 3, "seed": 1, "batch_size": 16}
+    config = {"lr": 2e-5, "num_epochs": 3, "seed": 42, "batch_size": 16}
     training_function(config, args)
 
 
